@@ -79,7 +79,8 @@ static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const st
 			throw std::runtime_error("Truncated frame header in: " + path_for_errors);
 		}
 		int32_t decompressed_len = static_cast<int32_t>(dlen_buf[0]) | (static_cast<int32_t>(dlen_buf[1]) << 8) |
-		                           (static_cast<int32_t>(dlen_buf[2]) << 16) | (static_cast<int32_t>(dlen_buf[3]) << 24);
+		                           (static_cast<int32_t>(dlen_buf[2]) << 16) |
+		                           (static_cast<int32_t>(dlen_buf[3]) << 24);
 		if (decompressed_len < 0) {
 			throw std::runtime_error("Invalid negative decompressed size in: " + path_for_errors);
 		}
@@ -92,9 +93,9 @@ static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const st
 		size_t prev_size = result.size();
 		result.resize(prev_size + decompressed_len);
 
-		int ret = LZ4_decompress_safe(reinterpret_cast<const char *>(comp_buf.data()),
-		                              reinterpret_cast<char *>(result.data() + prev_size), compressed_len,
-		                              decompressed_len);
+		int ret =
+		    LZ4_decompress_safe(reinterpret_cast<const char *>(comp_buf.data()),
+		                        reinterpret_cast<char *>(result.data() + prev_size), compressed_len, decompressed_len);
 		if (ret != decompressed_len) {
 			throw std::runtime_error("LZ4 decompression failed in: " + path_for_errors);
 		}
@@ -135,8 +136,8 @@ struct HailBlockMatrixBindData : public TableFunctionData {
 	int64_t n_rows;
 	int64_t n_cols;
 	int32_t block_size;
-	std::vector<std::string> part_files;   // path relative to <root>/parts/
-	std::vector<int32_t> block_indices;    // which block index each part_file corresponds to
+	std::vector<std::string> part_files; // path relative to <root>/parts/
+	std::vector<int32_t> block_indices;  // which block index each part_file corresponds to
 };
 
 // ---------------------------------------------------------------------------
@@ -248,7 +249,7 @@ static unique_ptr<FunctionData> HailBlockMatrixBind(ClientContext &context, Tabl
 // ---------------------------------------------------------------------------
 
 static unique_ptr<GlobalTableFunctionState> HailBlockMatrixInitGlobal(ClientContext &context,
-                                                                       TableFunctionInitInput &input) {
+                                                                      TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HailBlockMatrixBindData>();
 	return make_uniq<HailBlockMatrixGlobalState>(bind_data.part_files.size());
 }
@@ -258,8 +259,8 @@ static unique_ptr<GlobalTableFunctionState> HailBlockMatrixInitGlobal(ClientCont
 // ---------------------------------------------------------------------------
 
 static unique_ptr<LocalTableFunctionState> HailBlockMatrixInitLocal(ExecutionContext &context,
-                                                                     TableFunctionInitInput &input,
-                                                                     GlobalTableFunctionState *global_state) {
+                                                                    TableFunctionInitInput &input,
+                                                                    GlobalTableFunctionState *global_state) {
 	return make_uniq<HailBlockMatrixLocalState>();
 }
 
@@ -285,8 +286,7 @@ static void HailBlockMatrixScan(ClientContext &context, TableFunctionInput &data
 			}
 			local_state.current_part = part_idx;
 
-			std::string part_path =
-			    bind_data.path + "/parts/" + bind_data.part_files[part_idx];
+			std::string part_path = bind_data.path + "/parts/" + bind_data.part_files[part_idx];
 			int32_t block_idx = bind_data.block_indices[part_idx];
 
 			BlockInfo bi = ComputeBlockInfo(block_idx, bind_data.block_size, bind_data.n_rows, bind_data.n_cols);
@@ -308,7 +308,8 @@ static void HailBlockMatrixScan(ClientContext &context, TableFunctionInput &data
 			size_t cursor = 0;
 			auto read32 = [&]() -> int32_t {
 				int32_t v = static_cast<int32_t>(raw[cursor]) | (static_cast<int32_t>(raw[cursor + 1]) << 8) |
-				            (static_cast<int32_t>(raw[cursor + 2]) << 16) | (static_cast<int32_t>(raw[cursor + 3]) << 24);
+				            (static_cast<int32_t>(raw[cursor + 2]) << 16) |
+				            (static_cast<int32_t>(raw[cursor + 3]) << 24);
 				cursor += 4;
 				return v;
 			};
@@ -338,8 +339,8 @@ static void HailBlockMatrixScan(ClientContext &context, TableFunctionInput &data
 		}
 
 		// Emit elements from the current block into the output chunk
-		idx_t to_emit = std::min(capacity - out_row,
-		                         static_cast<idx_t>(local_state.total_elements - local_state.element_offset));
+		idx_t to_emit =
+		    std::min(capacity - out_row, static_cast<idx_t>(local_state.total_elements - local_state.element_offset));
 
 		auto &row_vec = output.data[0];
 		auto &col_vec = output.data[1];
