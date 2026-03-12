@@ -56,14 +56,16 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/quack_extension.cpp
     src/hail_blockmatrix_scanner.cpp
+    src/hail_codec.cpp
+    src/hail_table_scanner.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
 # Link dependencies in both the static library and the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json)
+target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json duckdb_zstd)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json duckdb_zstd)
 
 install(
   TARGETS ${EXTENSION_NAME}

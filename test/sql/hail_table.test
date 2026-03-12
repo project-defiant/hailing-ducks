@@ -1,0 +1,47 @@
+# name: test/sql/hail_table.test
+# description: Test hail_scan_table table function (flat schema — primitives and strings)
+# group: [sql]
+
+require quack
+
+require-env HAILING_DUCKS_ROOT
+
+# Total row count
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/variant_indices.ht');
+----
+1001
+
+# idx range (INT64 scalar field)
+query II
+SELECT MIN(idx), MAX(idx) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/variant_indices.ht');
+----
+0	1000
+
+# First five idx values (ordered)
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/variant_indices.ht') ORDER BY idx LIMIT 5;
+----
+0
+1
+2
+3
+4
+
+# Nested field locus is NULL (placeholder until Issue #4)
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/variant_indices.ht') WHERE locus IS NULL;
+----
+1001
+
+# Nested field alleles is NULL (placeholder until Issue #4)
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/variant_indices.ht') WHERE alleles IS NULL;
+----
+1001
+
+# Error: missing rows/metadata.json.gz
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/matrix.bm');
+----
+metadata
