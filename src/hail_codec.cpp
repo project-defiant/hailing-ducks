@@ -116,6 +116,11 @@ void ZstdBlockDecoder::skip_bytes(size_t n) {
 // Private helpers
 // ---------------------------------------------------------------------------
 
+static inline int32_t load_i32_le(const uint8_t *b) {
+	return static_cast<int32_t>(b[0]) | (static_cast<int32_t>(b[1]) << 8) | (static_cast<int32_t>(b[2]) << 16) |
+	       (static_cast<int32_t>(b[3]) << 24);
+}
+
 bool ZstdBlockDecoder::read_exact(void *buf, int64_t n) {
 	int64_t total = 0;
 	while (total < n) {
@@ -138,8 +143,7 @@ bool ZstdBlockDecoder::fill_block() {
 		eof_ = true;
 		return false;
 	}
-	int32_t stream_block_len = static_cast<int32_t>(hdr[0]) | (static_cast<int32_t>(hdr[1]) << 8) |
-	                           (static_cast<int32_t>(hdr[2]) << 16) | (static_cast<int32_t>(hdr[3]) << 24);
+	int32_t stream_block_len = load_i32_le(hdr);
 	if (stream_block_len < 4) {
 		throw std::runtime_error("Invalid stream block length (" + std::to_string(stream_block_len) + ") in: " + path_);
 	}
@@ -150,8 +154,7 @@ bool ZstdBlockDecoder::fill_block() {
 		throw std::runtime_error("Truncated stream block in: " + path_);
 	}
 
-	int32_t decomp_size = static_cast<int32_t>(inner[0]) | (static_cast<int32_t>(inner[1]) << 8) |
-	                      (static_cast<int32_t>(inner[2]) << 16) | (static_cast<int32_t>(inner[3]) << 24);
+	int32_t decomp_size = load_i32_le(inner.data());
 	if (decomp_size < 0) {
 		throw std::runtime_error("Invalid decompressed size in: " + path_);
 	}

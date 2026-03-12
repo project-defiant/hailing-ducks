@@ -393,8 +393,12 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	const auto &pf_arr = meta.at("rg").at("_partFiles");
 	for (auto &pf : pf_arr) {
 		std::string filename = pf.get<std::string>();
+		// Reject any filename that could escape the parts/ directory.
+		// Hail partition names are UUID-based (e.g. "part-00000-uuid"); any
+		// separator, dot-dot sequence, or percent character is suspicious.
 		if (filename.find("..") != std::string::npos || filename.find('/') != std::string::npos ||
-		    filename.find('\\') != std::string::npos) {
+		    filename.find('\\') != std::string::npos || filename.find('%') != std::string::npos ||
+		    filename.empty()) {
 			throw BinderException("Invalid partition filename in metadata (path traversal detected): " + filename);
 		}
 		bind_data->part_files.push_back(std::move(filename));
@@ -459,7 +463,9 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 		// --- Decode one row ---
 
 		// Read missing-bits bytes
-		uint8_t missing_bits[16] = {}; // max 128 optional fields
+		// Max 128 optional fields → 16 missing-bits bytes
+		static constexpr int MAX_MISSING_BYTES = 16;
+		uint8_t missing_bits[MAX_MISSING_BYTES] = {};
 		if (bind_data.n_missing_bytes > 0) {
 			dec.read_bytes(missing_bits, static_cast<size_t>(bind_data.n_missing_bytes));
 		}
