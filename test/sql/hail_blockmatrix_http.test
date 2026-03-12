@@ -1,8 +1,9 @@
 # name: test/sql/hail_blockmatrix_http.test
 # description: End-to-end test reading a BlockMatrix partition via HTTP using httpfs.
+# group: [sql]
+
 #              Requires a local HTTP server serving the repo root (see scripts/start_test_http_server.sh).
 #              Run with: make test_http
-# group: [quack]
 
 require quack
 

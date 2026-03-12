@@ -1,6 +1,6 @@
 # name: test/sql/hail_blockmatrix.test
 # description: Test hail_scan_blockmatrix table function
-# group: [quack]
+# group: [sql]
 
 require quack
 

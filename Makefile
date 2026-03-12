@@ -17,5 +17,5 @@ test_http: release
 	scripts/start_test_http_server.sh
 	sleep 1
 	HTTP_TEST_PORT=18642 ./build/release/$(TEST_PATH) "test/sql/hail_blockmatrix_http.test" || \
-	  (scripts/stop_test_http_server.sh; exit 1)
+	  { scripts/stop_test_http_server.sh; exit 1; }
 	scripts/stop_test_http_server.sh

@@ -23,8 +23,29 @@ if(NOT lz4_FOUND)
     )
 endif()
 
-# nlohmann-json: header-only, cmake config available via Homebrew/vcpkg
-find_package(nlohmann_json CONFIG REQUIRED)
+# nlohmann-json: header-only, try cmake config (vcpkg/Homebrew) then fall back to downloading the single header
+find_package(nlohmann_json CONFIG QUIET)
+if(NOT nlohmann_json_FOUND)
+    set(NLOHMANN_JSON_INCLUDE_FALLBACK "${CMAKE_CURRENT_BINARY_DIR}/include")
+    set(NLOHMANN_JSON_HEADER "${NLOHMANN_JSON_INCLUDE_FALLBACK}/nlohmann/json.hpp")
+    if(NOT EXISTS "${NLOHMANN_JSON_HEADER}")
+        message(STATUS "nlohmann_json not found via config; downloading single-header fallback")
+        file(MAKE_DIRECTORY "${NLOHMANN_JSON_INCLUDE_FALLBACK}/nlohmann")
+        file(DOWNLOAD
+            "https://github.com/nlohmann/json/releases/download/v3.11.3/json.hpp"
+            "${NLOHMANN_JSON_HEADER}"
+            STATUS NLOHMANN_DOWNLOAD_STATUS
+        )
+        list(GET NLOHMANN_DOWNLOAD_STATUS 0 NLOHMANN_STATUS_CODE)
+        if(NOT NLOHMANN_STATUS_CODE EQUAL 0)
+            message(FATAL_ERROR "Failed to download nlohmann/json single header")
+        endif()
+    endif()
+    add_library(nlohmann_json::nlohmann_json INTERFACE IMPORTED)
+    set_target_properties(nlohmann_json::nlohmann_json PROPERTIES
+        INTERFACE_INCLUDE_DIRECTORIES "${NLOHMANN_JSON_INCLUDE_FALLBACK}"
+    )
+endif()
 
 set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
