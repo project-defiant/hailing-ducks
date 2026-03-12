@@ -1,6 +1,7 @@
 #define DUCKDB_EXTENSION_MAIN
 
 #include "quack_extension.hpp"
+#include "hail_blockmatrix_scanner.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -35,6 +36,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto quack_openssl_version_scalar_function = ScalarFunction("quack_openssl_version", {LogicalType::VARCHAR},
 	                                                            LogicalType::VARCHAR, QuackOpenSSLVersionScalarFun);
 	loader.RegisterFunction(quack_openssl_version_scalar_function);
+
+	// Register Hail table scan functions
+	HailBlockMatrixScanFunction::Register(loader);
 }
 
 void QuackExtension::Load(ExtensionLoader &loader) {

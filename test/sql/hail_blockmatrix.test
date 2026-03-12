@@ -1,0 +1,30 @@
+# name: test/sql/hail_blockmatrix.test
+# description: Test hail_scan_blockmatrix table function
+# group: [quack]
+
+require quack
+
+# Total element count: 1000 * 1000 = 1,000,000
+query I
+SELECT COUNT(*) FROM hail_scan_blockmatrix('test/matrix.bm');
+----
+1000000
+
+# Row indices run 0..999
+query II
+SELECT MIN(row_idx), MAX(row_idx) FROM hail_scan_blockmatrix('test/matrix.bm');
+----
+0	999
+
+# Col indices run 0..999
+query II
+SELECT MIN(col_idx), MAX(col_idx) FROM hail_scan_blockmatrix('test/matrix.bm');
+----
+0	999
+
+# Each (row_idx, col_idx) pair is unique
+query I
+SELECT COUNT(*) = COUNT(DISTINCT row_idx * 10000 + col_idx)
+FROM hail_scan_blockmatrix('test/matrix.bm');
+----
+true
