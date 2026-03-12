@@ -6,6 +6,10 @@ A DuckDB extension that reads [Hail](https://hail.is/) native binary file format
 The extension registers DuckDB table functions so you can query Hail data directly
 in SQL, join it with other tables, and export it to any format DuckDB supports.
 
+All file I/O is routed through DuckDB's virtual filesystem (VFS), so any storage
+backend supported by DuckDB — local disk, Amazon S3, Google Cloud Storage, HTTP/HTTPS
+— works transparently once the appropriate DuckDB extension (e.g. `httpfs`) is loaded.
+
 ## Supported formats
 
 | Hail type | File pattern | DuckDB function |
@@ -141,11 +145,60 @@ con.execute(
 
 ---
 
+## Cloud storage (S3 / GCS / HTTP)
+
+Because all file I/O uses DuckDB's VFS layer, cloud paths work out of the box once
+the `httpfs` extension is loaded.
+
+### Amazon S3
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+-- Set credentials (or configure via environment / instance profile)
+SET s3_region = 'us-east-1';
+SET s3_access_key_id = '...';
+SET s3_secret_access_key = '...';
+
+SELECT * FROM hail_scan_blockmatrix('s3://my-bucket/path/to/matrix.bm') LIMIT 10;
+```
+
+### Google Cloud Storage
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+-- GCS is accessed via the S3-compatible XML API
+SET s3_endpoint = 'storage.googleapis.com';
+SET s3_access_key_id = '<HMAC key>';
+SET s3_secret_access_key = '<HMAC secret>';
+
+SELECT * FROM hail_scan_blockmatrix('s3://my-gcs-bucket/path/to/matrix.bm') LIMIT 10;
+```
+
+### HTTP / HTTPS
+
+```sql
+INSTALL httpfs;
+LOAD httpfs;
+
+SELECT * FROM hail_scan_blockmatrix('https://example.com/path/to/matrix.bm') LIMIT 10;
+```
+
+> **Note:** The `httpfs` extension is not bundled with the debug/test build.
+> Load it separately in production DuckDB installations.
+
+---
+
 ## Usage
 
 ### `hail_scan_blockmatrix(path)`
 
 Scans a Hail BlockMatrix directory and returns one row per matrix element.
+The `path` argument accepts any URI scheme supported by the loaded DuckDB
+filesystem extensions (`/local/path`, `s3://`, `gs://`, `https://`, …).
 
 ```sql
 -- Read every element
@@ -199,6 +252,21 @@ be run directly:
 ./build/release/test/unittest --test-dir . [sql]
 ```
 
+### HTTP integration tests
+
+An additional test suite validates reading over HTTP/HTTPS.  It requires:
+
+1. A DuckDB build that includes `httpfs`
+2. Python 3 (for the local test server)
+
+```sh
+make test_http
+```
+
+This target automatically starts a local Python HTTP server (port 18642),
+runs `test/sql/hail_blockmatrix_http.test`, then stops the server.
+The test is skipped if `httpfs` is not available in the build.
+
 ---
 
 ## Project structure
@@ -209,13 +277,17 @@ hailing-ducks/
 │   ├── include/
 │   │   ├── hail_blockmatrix_scanner.hpp   # BlockMatrix function declaration
 │   │   └── quack_extension.hpp            # Extension entry point declaration
-│   ├── hail_blockmatrix_scanner.cpp       # BlockMatrix scanner implementation
+│   ├── hail_blockmatrix_scanner.cpp       # BlockMatrix scanner implementation (VFS I/O)
 │   └── quack_extension.cpp                # DuckDB extension registration
 ├── test/
 │   ├── sql/
-│   │   ├── hail_blockmatrix.test          # BlockMatrix SQL tests
+│   │   ├── hail_blockmatrix.test          # BlockMatrix SQL tests (local + error paths)
+│   │   ├── hail_blockmatrix_http.test     # HTTP integration test (requires httpfs)
 │   │   └── quack.test                     # Baseline extension tests
 │   └── matrix.bm/                         # 1000×1000 test fixture (blockSize=4096)
+├── scripts/
+│   ├── start_test_http_server.sh          # Starts Python HTTP server for integration tests
+│   └── stop_test_http_server.sh           # Stops the test HTTP server
 ├── CMakeLists.txt                          # Build configuration
 ├── vcpkg.json                              # vcpkg dependency manifest
 └── extension_config.cmake                  # DuckDB extension config hook
@@ -236,6 +308,7 @@ A `.bm` directory contains:
 ## Roadmap
 
 - [x] Phase 1 — BlockMatrix scanner (`hail_scan_blockmatrix`)
+- [x] Cloud storage support — S3, GCS, HTTP via DuckDB VFS / `httpfs`
 - [ ] Phase 2 — HailTable scanner (`hail_scan_table`)
   - Dynamic schema from `metadata.json.gz`
   - BufferSpec-aware decompression (Zstd, LZ4HC, uncompressed)
