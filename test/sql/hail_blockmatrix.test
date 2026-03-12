@@ -28,3 +28,26 @@ SELECT COUNT(*) = COUNT(DISTINCT row_idx * 10000 + col_idx)
 FROM hail_scan_blockmatrix('test/matrix.bm');
 ----
 true
+
+# ---------------------------------------------------------------------------
+# Absolute-path test: proves the VFS layer handles non-relative local paths.
+# HAILING_DUCKS_ROOT is exported by the Makefile (= project root, no trailing slash).
+# ---------------------------------------------------------------------------
+
+require-env HAILING_DUCKS_ROOT
+
+query I
+SELECT COUNT(*) FROM hail_scan_blockmatrix('${HAILING_DUCKS_ROOT}/test/matrix.bm');
+----
+1000000
+
+# ---------------------------------------------------------------------------
+# Unknown-scheme error test: without httpfs loaded an s3:// path must produce
+# a clear DuckDB error rather than a raw C++ exception from std::ifstream.
+# ---------------------------------------------------------------------------
+
+statement error
+SELECT COUNT(*) FROM hail_scan_blockmatrix('s3://fake-bucket/fake.bm');
+----
+fake-bucket
+

@@ -1,0 +1,34 @@
+# name: test/sql/hail_blockmatrix_http.test
+# description: End-to-end test reading a BlockMatrix partition via HTTP using httpfs.
+#              Requires a local HTTP server serving the repo root (see scripts/start_test_http_server.sh).
+#              Run with: make test_http
+# group: [quack]
+
+require quack
+
+require httpfs
+
+# HTTP_TEST_PORT is set to 18642 by the Makefile test_http target.
+require-env HTTP_TEST_PORT
+
+# Load httpfs so DuckDB can resolve http:// URIs
+load httpfs
+
+# Total element count must match the local-path result
+query I
+SELECT COUNT(*) FROM hail_scan_blockmatrix('http://localhost:${HTTP_TEST_PORT}/test/matrix.bm');
+----
+1000000
+
+# Row and column index bounds match
+query II
+SELECT MIN(row_idx), MAX(row_idx)
+FROM hail_scan_blockmatrix('http://localhost:${HTTP_TEST_PORT}/test/matrix.bm');
+----
+0	999
+
+query II
+SELECT MIN(col_idx), MAX(col_idx)
+FROM hail_scan_blockmatrix('http://localhost:${HTTP_TEST_PORT}/test/matrix.bm');
+----
+0	999

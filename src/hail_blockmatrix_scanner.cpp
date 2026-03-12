@@ -1,14 +1,14 @@
 #include "hail_blockmatrix_scanner.hpp"
 
 #include "duckdb/common/exception.hpp"
+#include "duckdb/common/file_open_flags.hpp"
+#include "duckdb/common/file_system.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/function/function.hpp"
 
 #include <nlohmann/json.hpp>
 #include <lz4.h>
 
-#include <fstream>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -36,53 +36,57 @@ using json = nlohmann::json;
 //     [float64 * nRows * nCols: data (column-major if !isTranspose, row-major if isTranspose)]
 // ---------------------------------------------------------------------------
 
-static int32_t read_le_int32(std::istream &in) {
-	uint8_t buf[4];
-	in.read(reinterpret_cast<char *>(buf), 4);
-	if (!in) {
-		throw std::runtime_error("Unexpected EOF reading int32");
-	}
-	return static_cast<int32_t>(buf[0]) | (static_cast<int32_t>(buf[1]) << 8) |
-	       (static_cast<int32_t>(buf[2]) << 16) | (static_cast<int32_t>(buf[3]) << 24);
-}
-
 // Decompress a Hail LZ4-blocked stream into a flat byte vector.
-static std::vector<uint8_t> DecompressHailLz4Stream(const std::string &path) {
-	std::ifstream f(path, std::ios::binary);
-	if (!f.is_open()) {
-		throw std::runtime_error("Cannot open block matrix part file: " + path);
-	}
+// Uses DuckDB's FileHandle so any VFS backend (local, S3, GCS, HTTP, …) is supported.
+static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const std::string &path_for_errors) {
+	// Helper: read exactly n bytes, looping over partial reads (common for HTTP/cloud backends).
+	// Returns false only at a clean EOF at a frame boundary (0 bytes read when expecting frame header).
+	auto read_exact = [&](void *buf, int64_t n) -> bool {
+		int64_t total = 0;
+		while (total < n) {
+			int64_t got = handle.Read(static_cast<uint8_t *>(buf) + total, static_cast<idx_t>(n - total));
+			if (got == 0) {
+				if (total == 0) {
+					return false; // clean EOF between frames
+				}
+				throw std::runtime_error("Truncated read in: " + path_for_errors);
+			}
+			total += got;
+		}
+		return true;
+	};
 
 	std::vector<uint8_t> result;
 	result.reserve(64 * 1024);
 
 	while (true) {
-		// Peek: try to read outer_frame_size; break cleanly on EOF
+		// Try to read outer_frame_size; break cleanly on EOF between frames.
 		uint8_t probe[4];
-		f.read(reinterpret_cast<char *>(probe), 4);
-		if (f.eof() || f.gcount() == 0) {
+		if (!read_exact(probe, 4)) {
 			break;
-		}
-		if (f.gcount() != 4) {
-			throw std::runtime_error("Truncated frame header in: " + path);
 		}
 
 		int32_t outer_frame_size = static_cast<int32_t>(probe[0]) | (static_cast<int32_t>(probe[1]) << 8) |
 		                           (static_cast<int32_t>(probe[2]) << 16) | (static_cast<int32_t>(probe[3]) << 24);
 		if (outer_frame_size < 4) {
-			throw std::runtime_error("Invalid LZ4 frame size in: " + path);
+			throw std::runtime_error("Invalid LZ4 frame size in: " + path_for_errors);
 		}
 
 		int32_t compressed_len = outer_frame_size - 4;
-		int32_t decompressed_len = read_le_int32(f);
+
+		uint8_t dlen_buf[4];
+		if (!read_exact(dlen_buf, 4)) {
+			throw std::runtime_error("Truncated frame header in: " + path_for_errors);
+		}
+		int32_t decompressed_len = static_cast<int32_t>(dlen_buf[0]) | (static_cast<int32_t>(dlen_buf[1]) << 8) |
+		                           (static_cast<int32_t>(dlen_buf[2]) << 16) | (static_cast<int32_t>(dlen_buf[3]) << 24);
 		if (decompressed_len < 0) {
-			throw std::runtime_error("Invalid negative decompressed size in: " + path);
+			throw std::runtime_error("Invalid negative decompressed size in: " + path_for_errors);
 		}
 
 		std::vector<uint8_t> comp_buf(compressed_len);
-		f.read(reinterpret_cast<char *>(comp_buf.data()), compressed_len);
-		if (f.gcount() != compressed_len) {
-			throw std::runtime_error("Truncated LZ4 compressed data in: " + path);
+		if (!read_exact(comp_buf.data(), compressed_len)) {
+			throw std::runtime_error("Truncated LZ4 compressed data in: " + path_for_errors);
 		}
 
 		size_t prev_size = result.size();
@@ -92,7 +96,7 @@ static std::vector<uint8_t> DecompressHailLz4Stream(const std::string &path) {
 		                              reinterpret_cast<char *>(result.data() + prev_size), compressed_len,
 		                              decompressed_len);
 		if (ret != decompressed_len) {
-			throw std::runtime_error("LZ4 decompression failed in: " + path);
+			throw std::runtime_error("LZ4 decompression failed in: " + path_for_errors);
 		}
 	}
 
@@ -185,15 +189,21 @@ static unique_ptr<FunctionData> HailBlockMatrixBind(ClientContext &context, Tabl
 	auto bind_data = make_uniq<HailBlockMatrixBindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 
-	// Read metadata.json
+	// Read metadata.json via DuckDB VFS (supports local paths, s3://, gs://, http://, etc.)
 	std::string meta_path = bind_data->path + "/metadata.json";
-	std::ifstream mf(meta_path);
-	if (!mf.is_open()) {
-		throw BinderException("Cannot open Hail BlockMatrix metadata: " + meta_path);
+	auto &fs = FileSystem::GetFileSystem(context);
+	unique_ptr<FileHandle> meta_handle;
+	try {
+		meta_handle = fs.OpenFile(meta_path, FileFlags::FILE_FLAGS_READ);
+	} catch (const std::exception &e) {
+		throw BinderException("Cannot open Hail BlockMatrix metadata: " + meta_path + ": " + e.what());
 	}
+	int64_t file_size = fs.GetFileSize(*meta_handle);
+	std::vector<uint8_t> meta_raw(static_cast<size_t>(file_size));
+	meta_handle->Read(meta_raw.data(), static_cast<idx_t>(file_size));
 	json meta;
 	try {
-		mf >> meta;
+		meta = json::parse(meta_raw.begin(), meta_raw.end());
 	} catch (const std::exception &e) {
 		throw BinderException("Failed to parse BlockMatrix metadata at " + meta_path + ": " + e.what());
 	}
@@ -286,8 +296,10 @@ static void HailBlockMatrixScan(ClientContext &context, TableFunctionInput &data
 			local_state.block_n_cols = bi.block_n_cols;
 			local_state.element_offset = 0;
 
-			// Decompress and parse the block
-			std::vector<uint8_t> raw = DecompressHailLz4Stream(part_path);
+			// Decompress and parse the block via DuckDB VFS
+			auto &fs = FileSystem::GetFileSystem(context);
+			auto part_handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			std::vector<uint8_t> raw = DecompressHailLz4Stream(*part_handle, part_path);
 
 			// Parse header: int32 nRows, int32 nCols, bool isTranspose
 			if (raw.size() < 9) {
