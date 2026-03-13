@@ -120,10 +120,15 @@ uint32_t ZstdBlockDecoder::read_leb128_u32() {
 	uint32_t result = 0;
 	int shift = 0;
 	uint8_t b;
+	int count = 0;
 	do {
+		if (count >= 5) {
+			throw std::runtime_error("LEB128 u32 overflow (>5 bytes) in: " + path_);
+		}
 		b = read_byte();
 		result |= (static_cast<uint32_t>(b & 0x7F) << shift);
 		shift += 7;
+		count++;
 	} while (b & 0x80);
 	return result;
 }
@@ -132,10 +137,15 @@ uint64_t ZstdBlockDecoder::read_leb128_u64() {
 	uint64_t result = 0;
 	int shift = 0;
 	uint8_t b;
+	int count = 0;
 	do {
+		if (count >= 10) {
+			throw std::runtime_error("LEB128 u64 overflow (>10 bytes) in: " + path_);
+		}
 		b = read_byte();
 		result |= (static_cast<uint64_t>(b & 0x7F) << shift);
 		shift += 7;
+		count++;
 	} while (b & 0x80);
 	return result;
 }
@@ -327,7 +337,6 @@ struct HailLeb128U32LocalState : public LocalTableFunctionState {
 	std::unique_ptr<ZstdBlockDecoder> decoder;
 	uint32_t count = 0;
 	uint32_t idx = 0;
-	bool initialised = false;
 };
 
 static unique_ptr<FunctionData> HailLeb128U32Bind(ClientContext &context, TableFunctionBindInput &input,
@@ -349,7 +358,6 @@ static unique_ptr<LocalTableFunctionState> HailLeb128U32InitLocal(ExecutionConte
 	local->decoder = make_uniq<ZstdBlockDecoder>(*local->handle, bind_data.path);
 	local->count = local->decoder->read_leb128_u32(); // first value is count
 	local->idx = 0;
-	local->initialised = true;
 	return std::move(local);
 }
 
