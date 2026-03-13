@@ -2,6 +2,7 @@
 
 #include "quack_extension.hpp"
 #include "hail_blockmatrix_scanner.hpp"
+#include "hail_codec.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -39,6 +40,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 
 	// Register Hail table scan functions
 	HailBlockMatrixScanFunction::Register(loader);
+	HailCodecScanFunction::Register(loader);
 }
 
 void QuackExtension::Load(ExtensionLoader &loader) {

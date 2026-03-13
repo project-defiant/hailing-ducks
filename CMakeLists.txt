@@ -56,6 +56,7 @@ include_directories(src/include)
 set(EXTENSION_SOURCES
     src/quack_extension.cpp
     src/hail_blockmatrix_scanner.cpp
+    src/hail_codec.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
