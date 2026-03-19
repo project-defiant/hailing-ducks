@@ -67,7 +67,7 @@ bool ZstdBlockDecoder::fill_block() {
 
 	block_buf_.resize(static_cast<size_t>(decomp_size));
 	size_t ret = duckdb_zstd::ZSTD_decompress(block_buf_.data(), static_cast<size_t>(decomp_size), raw.data() + 4,
-	                             static_cast<size_t>(stream_block_len - 4));
+	                                          static_cast<size_t>(stream_block_len - 4));
 	if (duckdb_zstd::ZSTD_isError(ret)) {
 		throw std::runtime_error(std::string("Zstd decompression error in: ") + path_ + ": " +
 		                         duckdb_zstd::ZSTD_getErrorName(ret));
@@ -257,7 +257,7 @@ struct HailZstdInfoLocalState : public LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HailZstdInfoBind(ClientContext &context, TableFunctionBindInput &input,
-                                                  vector<LogicalType> &return_types, vector<string> &names) {
+                                                 vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<HailZstdInfoBindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 	names = {"frame_idx", "decomp_size"};
@@ -265,9 +265,8 @@ static unique_ptr<FunctionData> HailZstdInfoBind(ClientContext &context, TableFu
 	return std::move(bind_data);
 }
 
-static unique_ptr<LocalTableFunctionState> HailZstdInfoInitLocal(ExecutionContext &context,
-                                                                  TableFunctionInitInput &input,
-                                                                  GlobalTableFunctionState *) {
+static unique_ptr<LocalTableFunctionState>
+HailZstdInfoInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
 	auto &bind_data = input.bind_data->Cast<HailZstdInfoBindData>();
 	auto local = make_uniq<HailZstdInfoLocalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -340,7 +339,7 @@ struct HailLeb128U32LocalState : public LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HailLeb128U32Bind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<HailLeb128U32BindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 	names = {"value"};
@@ -348,9 +347,8 @@ static unique_ptr<FunctionData> HailLeb128U32Bind(ClientContext &context, TableF
 	return std::move(bind_data);
 }
 
-static unique_ptr<LocalTableFunctionState> HailLeb128U32InitLocal(ExecutionContext &context,
-                                                                   TableFunctionInitInput &input,
-                                                                   GlobalTableFunctionState *) {
+static unique_ptr<LocalTableFunctionState>
+HailLeb128U32InitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
 	auto &bind_data = input.bind_data->Cast<HailLeb128U32BindData>();
 	auto local = make_uniq<HailLeb128U32LocalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
@@ -396,7 +394,7 @@ struct HailLeb128U64LocalState : public LocalTableFunctionState {
 };
 
 static unique_ptr<FunctionData> HailLeb128U64Bind(ClientContext &context, TableFunctionBindInput &input,
-                                                   vector<LogicalType> &return_types, vector<string> &names) {
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
 	auto bind_data = make_uniq<HailLeb128U64BindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 	names = {"value"};
@@ -404,9 +402,8 @@ static unique_ptr<FunctionData> HailLeb128U64Bind(ClientContext &context, TableF
 	return std::move(bind_data);
 }
 
-static unique_ptr<LocalTableFunctionState> HailLeb128U64InitLocal(ExecutionContext &context,
-                                                                   TableFunctionInitInput &input,
-                                                                   GlobalTableFunctionState *) {
+static unique_ptr<LocalTableFunctionState>
+HailLeb128U64InitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
 	auto &bind_data = input.bind_data->Cast<HailLeb128U64BindData>();
 	auto local = make_uniq<HailLeb128U64LocalState>();
 	auto &fs = FileSystem::GetFileSystem(context.client);
