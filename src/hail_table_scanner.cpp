@@ -456,7 +456,7 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 		}
 
 		auto &dec = *local_state.decoder;
-		if (!dec.has_more_data()) {
+		if (dec.eof()) {
 			break;
 		}
 
