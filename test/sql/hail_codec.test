@@ -1,0 +1,90 @@
+# name: test/sql/hail_codec.test
+# description: Test ZstdBlockDecoder, LEB128 reader, and hail_zstd_info helpers
+# group: [sql]
+
+require quack
+
+# ---------------------------------------------------------------------------
+# hail_zstd_info: frame metadata (decomp_size) from the stream
+# ---------------------------------------------------------------------------
+
+# The synthetic variant_indices.ht part file has exactly one frame with
+# decomp_size = 30145 (acceptance criterion from issue #2).
+query II
+SELECT frame_idx, decomp_size
+FROM hail_zstd_info('test/variant_indices.ht/rows/parts/part-00000-dc70bdc7-fa3a-4c4a-b60f-324b0e34b4d6');
+----
+0	30145
+
+# The leb128_u32.bin test file also has exactly one frame.
+query I
+SELECT COUNT(*) FROM hail_zstd_info('test/codec/leb128_u32.bin');
+----
+1
+
+# ---------------------------------------------------------------------------
+# hail_leb128_u32: unsigned LEB128 round-trip tests
+#
+# The test file encodes [count=10] then 10 known values:
+#   0, 1, 127, 128, 255, 16383, 16384, 2097151, 268435455, 4294967295
+#
+# 4294967295 = 0xFFFFFFFF = UINT32_MAX, encodes -1 (i32) as unsigned LEB128:
+#   FF FF FF FF 0F  (5 bytes)
+# ---------------------------------------------------------------------------
+
+query I
+SELECT value FROM hail_leb128_u32('test/codec/leb128_u32.bin');
+----
+0
+1
+127
+128
+255
+16383
+16384
+2097151
+268435455
+4294967295
+
+# Aggregates verify correctness without relying on row order
+query II
+SELECT COUNT(*), SUM(value::UBIGINT)
+FROM hail_leb128_u32('test/codec/leb128_u32.bin');
+----
+10	4565533179
+
+# The variant_indices.ht file has the same count-prefixed payload padded to
+# 30145 bytes.  The count prefix guarantees only the first 10 values are read.
+query I
+SELECT COUNT(*) FROM hail_leb128_u32(
+    'test/variant_indices.ht/rows/parts/part-00000-dc70bdc7-fa3a-4c4a-b60f-324b0e34b4d6');
+----
+10
+
+# ---------------------------------------------------------------------------
+# hail_leb128_u64: unsigned LEB128 u64 round-trip tests
+#
+# The test file encodes [count=11] then 11 known values including:
+#   549755813887   = 2^39 - 1  (6-byte LEB128)
+#   18446744073709551615 = UINT64_MAX (10-byte LEB128)
+# ---------------------------------------------------------------------------
+
+query I
+SELECT value FROM hail_leb128_u64('test/codec/leb128_u64.bin');
+----
+0
+1
+127
+128
+255
+16383
+16384
+268435455
+4294967295
+549755813887
+18446744073709551615
+
+query II
+SELECT COUNT(*), MAX(value) FROM hail_leb128_u64('test/codec/leb128_u64.bin');
+----
+11	18446744073709551615
