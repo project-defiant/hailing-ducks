@@ -3,6 +3,7 @@
 #include "quack_extension.hpp"
 #include "hail_blockmatrix_scanner.hpp"
 #include "hail_codec.hpp"
+#include "hail_type_parser.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -28,6 +29,22 @@ inline void QuackOpenSSLVersionScalarFun(DataChunk &args, ExpressionState &state
 	});
 }
 
+inline void HailDebugEtypeScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &input = args.data[0];
+	UnaryExecutor::Execute<string_t, string_t>(input, result, args.size(), [&](string_t s) {
+		auto node = parse_etype(s.GetString());
+		return StringVector::AddString(result, etype_to_string(node));
+	});
+}
+
+inline void HailDebugVtypeScalarFun(DataChunk &args, ExpressionState &state, Vector &result) {
+	auto &input = args.data[0];
+	UnaryExecutor::Execute<string_t, string_t>(input, result, args.size(), [&](string_t s) {
+		auto node = parse_vtype(s.GetString());
+		return StringVector::AddString(result, vtype_to_string(node));
+	});
+}
+
 static void LoadInternal(ExtensionLoader &loader) {
 	// Register a scalar function
 	auto quack_scalar_function = ScalarFunction("quack", {LogicalType::VARCHAR}, LogicalType::VARCHAR, QuackScalarFun);
@@ -37,6 +54,14 @@ static void LoadInternal(ExtensionLoader &loader) {
 	auto quack_openssl_version_scalar_function = ScalarFunction("quack_openssl_version", {LogicalType::VARCHAR},
 	                                                            LogicalType::VARCHAR, QuackOpenSSLVersionScalarFun);
 	loader.RegisterFunction(quack_openssl_version_scalar_function);
+
+	auto hail_debug_etype_function =
+	    ScalarFunction("hail_debug_etype", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HailDebugEtypeScalarFun);
+	loader.RegisterFunction(hail_debug_etype_function);
+
+	auto hail_debug_vtype_function =
+	    ScalarFunction("hail_debug_vtype", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HailDebugVtypeScalarFun);
+	loader.RegisterFunction(hail_debug_vtype_function);
 
 	// Register Hail table scan functions
 	HailBlockMatrixScanFunction::Register(loader);

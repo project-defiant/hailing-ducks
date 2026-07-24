@@ -57,6 +57,7 @@ set(EXTENSION_SOURCES
     src/quack_extension.cpp
     src/hail_blockmatrix_scanner.cpp
     src/hail_codec.cpp
+    src/hail_type_parser.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})

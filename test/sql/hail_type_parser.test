@@ -1,0 +1,61 @@
+# name: test/sql/hail_type_parser.test
+# description: Test Hail VType/EType string parser via debug scalar functions
+# group: [sql]
+
+require quack
+
+# --- EType round trips ---
+
+query I
+SELECT hail_debug_etype('EInt32');
+----
+EInt32
+
+query I
+SELECT hail_debug_etype('EArray[+EBinary]');
+----
+EArray[+EBinary]
+
+query I
+SELECT hail_debug_etype('EBaseStruct{contig:+EBinary,position:+EInt32}');
+----
+EBaseStruct{contig:+EBinary,position:+EInt32}
+
+query I
+SELECT hail_debug_etype('EBaseStruct{idx:+EInt64,locus:+EBaseStruct{contig:+EBinary,position:+EInt32},alleles:+EArray[+EBinary],pop_freq:+EBaseStruct{AC:+EInt32,AF:+EFloat64,AN:+EInt32,homozygote_count:+EInt32}}');
+----
+EBaseStruct{idx:+EInt64,locus:+EBaseStruct{contig:+EBinary,position:+EInt32},alleles:+EArray[+EBinary],pop_freq:+EBaseStruct{AC:+EInt32,AF:+EFloat64,AN:+EInt32,homozygote_count:+EInt32}}
+
+# --- VType round trips ---
+
+query I
+SELECT hail_debug_vtype('Int64');
+----
+Int64
+
+query I
+SELECT hail_debug_vtype('Locus(GRCh37)');
+----
+Locus(GRCh37)
+
+query I
+SELECT hail_debug_vtype('Struct{contig:String,position:Int32}');
+----
+Struct{contig:String,position:Int32}
+
+query I
+SELECT hail_debug_vtype('Struct{idx:Int64,locus:Locus(GRCh37),alleles:Array[String],pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}');
+----
+Struct{idx:Int64,locus:Locus(GRCh37),alleles:Array[String],pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}
+
+# --- Error cases ---
+
+statement error
+SELECT hail_debug_etype('NotAType');
+----
+Unrecognized EType
+
+statement error
+SELECT hail_debug_etype('EBaseStruct{contig:+EBinary');
+----
+Expected '}'
