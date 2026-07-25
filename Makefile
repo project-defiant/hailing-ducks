@@ -9,6 +9,7 @@ include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
 ifneq (,$(filter windows_%,$(DUCKDB_PLATFORM)))
 	TEST_PATH=test/unittest.exe
+	export PATH := ./build/release/src:./build/debug/src:./build/reldebug/src:$(PATH)
 endif
 
 # Export the project root so SQLLogicTests can substitute ${HAILING_DUCKS_ROOT} in path expressions
