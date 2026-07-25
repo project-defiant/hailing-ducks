@@ -64,9 +64,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	loader.RegisterFunction(hail_debug_vtype_function);
 
 	// Register Hail table scan functions
-#ifdef HAVE_LZ4
 	HailBlockMatrixScanFunction::Register(loader);
-#endif
 	HailCodecScanFunction::Register(loader);
 }
 
