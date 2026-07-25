@@ -33,6 +33,7 @@ OPTIONAL_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_optional.ht"
 LZ4HC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4hc.ht"
 LZ4FAST_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4fast.ht"
 BAD_CODEC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_bad_codec.ht"
+OPTIONAL_ARRAY_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_optional_array.ht"
 
 VTYPE = ("Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String],"
          "pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}")
@@ -213,6 +214,12 @@ OPTIONAL_ROWS = [
     {"idx": 2, "qual": 3.25},
 ]
 
+OPTIONAL_ARRAY_VTYPE = "Struct{idx:Int64,tags:Array[String]}"
+OPTIONAL_ARRAY_ETYPE = "+EBaseStruct{idx:+EInt64,tags:+EArray[EBinary]}"
+OPTIONAL_ARRAY_ROWS = [
+    {"idx": 0, "tags": ["A", None, "B"]},
+]
+
 
 def encode_optional_row(row: dict) -> bytes:
     is_null = row["qual"] is None
@@ -252,6 +259,52 @@ def write_optional_fixture(fixture_dir: Path, codec: str):
         "components": {
             "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
             "partition_counts": {"name": "PartitionCountsComponentSpec", "counts": [len(OPTIONAL_ROWS)]},
+        },
+    }
+    with gzip.open(fixture_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(top_metadata).encode("utf-8"))
+
+
+def encode_optional_array_row(row: dict) -> bytes:
+    out = bytearray()
+    out += leb128_u(row["idx"])
+    tags = row["tags"]
+    out += leb128_u(len(tags))
+    missing_byte = 0
+    for i, tag in enumerate(tags):
+        if tag is None:
+            missing_byte |= (1 << i)
+    out += bytes([missing_byte])
+    for tag in tags:
+        if tag is not None:
+            out += encode_string(tag)
+    return bytes(out)
+
+
+def write_optional_array_fixture(fixture_dir: Path, codec: str):
+    parts_dir = fixture_dir / "rows" / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    part_bytes = build_part_file(OPTIONAL_ARRAY_ROWS, codec, encode_fn=encode_optional_array_row)
+    (parts_dir / "part-00000").write_bytes(part_bytes)
+
+    rows_metadata = {
+        "_codecSpec": {
+            "_eType": OPTIONAL_ARRAY_ETYPE,
+            "_vType": OPTIONAL_ARRAY_VTYPE,
+            "_bufferSpec": buffer_spec_chain(codec),
+        },
+        "_partFiles": ["part-00000"],
+    }
+    with gzip.open(fixture_dir / "rows" / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(rows_metadata).encode("utf-8"))
+
+    top_metadata = {
+        "file_version": 1,
+        "table_type": f"Table{{global:Struct{{}},key:[],row:{OPTIONAL_ARRAY_VTYPE}}}",
+        "components": {
+            "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
+            "partition_counts": {"name": "PartitionCountsComponentSpec", "counts": [len(OPTIONAL_ARRAY_ROWS)]},
         },
     }
     with gzip.open(fixture_dir / "metadata.json.gz", "wb") as f:
@@ -333,3 +386,5 @@ if __name__ == "__main__":
     print("Wrote", LZ4FAST_FIXTURE_DIR)
     write_bad_codec_fixture(BAD_CODEC_FIXTURE_DIR)
     print("Wrote", BAD_CODEC_FIXTURE_DIR)
+    write_optional_array_fixture(OPTIONAL_ARRAY_FIXTURE_DIR, "zstd")
+    print("Wrote", OPTIONAL_ARRAY_FIXTURE_DIR)

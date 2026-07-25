@@ -126,10 +126,9 @@ static void SkipValue(const ETypeNode &etype, BlockDecoder &decoder) {
 }
 
 // ---------------------------------------------------------------------------
-// DecodeValue: like SkipValue, but writes scalar results into a DuckDB Vector
-// at the given row. Nested kinds (Array/BaseStruct) are skipped and the
-// output is left NULL — Task 5 replaces those two branches with real
-// LIST/STRUCT vector writes.
+// DecodeValue: recursively writes the value of an EType into a DuckDB Vector
+// at the given row. Optional/null handling is owned by the caller for the
+// current value; nested arrays/structs read their own missing-bit prefixes.
 // ---------------------------------------------------------------------------
 
 static void DecodeValue(const ETypeNode &etype, BlockDecoder &decoder, Vector &out, idx_t row) {
@@ -157,11 +156,64 @@ static void DecodeValue(const ETypeNode &etype, BlockDecoder &decoder, Vector &o
 		    StringVector::AddString(out, reinterpret_cast<const char *>(buf.data()), len);
 		return;
 	}
-	case EKind::Array:
-	case EKind::BaseStruct:
-		SkipValue(etype, decoder);
-		FlatVector::SetNull(out, row, true);
+	case EKind::Array: {
+		uint32_t len = decoder.read_leb128_u32();
+		const ETypeNode &elem = etype.children[0];
+
+		std::vector<uint8_t> missing_bits;
+		if (!elem.required) {
+			missing_bits.resize((static_cast<size_t>(len) + 7) / 8);
+			if (!missing_bits.empty()) {
+				decoder.read_bytes(missing_bits.data(), missing_bits.size());
+			}
+		}
+
+		idx_t offset = ListVector::GetListSize(out);
+		ListVector::Reserve(out, offset + len);
+		Vector &child = ListVector::GetEntry(out);
+
+		for (uint32_t i = 0; i < len; i++) {
+			bool is_null = !elem.required && ((missing_bits[i / 8] >> (i % 8)) & 1);
+			if (is_null) {
+				FlatVector::SetNull(child, offset + i, true);
+			} else {
+				DecodeValue(elem, decoder, child, offset + i);
+			}
+		}
+
+		ListVector::SetListSize(out, offset + len);
+		ListVector::GetData(out)[row] = list_entry_t {offset, len};
 		return;
+	}
+	case EKind::BaseStruct: {
+		int n_optional = 0;
+		for (auto &f : etype.children) {
+			if (!f.required) {
+				n_optional++;
+			}
+		}
+		std::vector<uint8_t> missing_bits((static_cast<size_t>(n_optional) + 7) / 8);
+		if (!missing_bits.empty()) {
+			decoder.read_bytes(missing_bits.data(), missing_bits.size());
+		}
+
+		auto &entries = StructVector::GetEntries(out);
+		int optional_idx = 0;
+		for (idx_t i = 0; i < etype.children.size(); i++) {
+			const ETypeNode &field = etype.children[i];
+			bool is_null = false;
+			if (!field.required) {
+				is_null = (missing_bits[optional_idx / 8] >> (optional_idx % 8)) & 1;
+				optional_idx++;
+			}
+			if (is_null) {
+				FlatVector::SetNull(*entries[i], row, true);
+			} else {
+				DecodeValue(field, decoder, *entries[i], row);
+			}
+		}
+		return;
+	}
 	}
 	throw std::runtime_error("Unhandled EKind in DecodeValue");
 }

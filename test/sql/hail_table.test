@@ -20,21 +20,42 @@ SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht
 1
 2
 
-# --- Nested fields not yet decoded: present in schema, NULL at scan time ---
+# --- Nested STRUCT field (locus) ---
+
+query II
+SELECT locus.contig, locus.position
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+1	10000
+1	10050
+2	20000
+
+# --- Nested LIST field (alleles) ---
 
 query I
-SELECT locus IS NULL FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+SELECT alleles FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
 ----
-true
-true
-true
+[A, T]
+[G, C, A]
+[T, G]
 
-query I
-SELECT alleles IS NULL FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+# --- Nested STRUCT field (pop_freq), sub-field access ---
+
+query IIII
+SELECT pop_freq.AC, pop_freq.AF, pop_freq.AN, pop_freq.homozygote_count
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
 ----
-true
-true
-true
+5	0.001	5000	0
+12	0.0024	5000	1
+0	0.0	4998	0
+
+# --- Optional LIST element: NULL elements occupy zero bytes on the wire ---
+
+query III
+SELECT tags[1], tags[2], tags[3]
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_optional_array.ht') ORDER BY idx;
+----
+A	NULL	B
 
 # --- Optional top-level field: row struct's own missing-bit prefix must be
 # read before decoding its fields (regression test for task-3 fix Important
