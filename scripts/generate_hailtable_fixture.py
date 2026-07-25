@@ -34,6 +34,8 @@ LZ4HC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4hc.ht"
 LZ4FAST_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4fast.ht"
 BAD_CODEC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_bad_codec.ht"
 OPTIONAL_ARRAY_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_optional_array.ht"
+ALT_ROWS_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_alt_rows.ht"
+TYPE_MISMATCH_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_type_mismatch.ht"
 
 VTYPE = ("Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String],"
          "pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}")
@@ -311,8 +313,9 @@ def write_optional_array_fixture(fixture_dir: Path, codec: str):
         f.write(json.dumps(top_metadata).encode("utf-8"))
 
 
-def write_fixture(fixture_dir: Path, codec: str):
-    parts_dir = fixture_dir / "rows" / "parts"
+def write_fixture(fixture_dir: Path, codec: str, rows_rel_path: str = "rows"):
+    rows_dir = fixture_dir / rows_rel_path
+    parts_dir = rows_dir / "parts"
     parts_dir.mkdir(parents=True, exist_ok=True)
 
     part_bytes = build_part_file(ROWS, codec)
@@ -330,7 +333,7 @@ def write_fixture(fixture_dir: Path, codec: str):
         },
         "_partFiles": ["part-00000"],
     }
-    with gzip.open(fixture_dir / "rows" / "metadata.json.gz", "wb") as f:
+    with gzip.open(rows_dir / "metadata.json.gz", "wb") as f:
         f.write(json.dumps(rows_metadata).encode("utf-8"))
 
     # Top-level metadata.json.gz: components.rows.rel_path points at the
@@ -340,7 +343,7 @@ def write_fixture(fixture_dir: Path, codec: str):
         "file_version": 1,
         "table_type": f"Table{{global:Struct{{}},key:[],row:{VTYPE}}}",
         "components": {
-            "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
+            "rows": {"name": "RVDComponentSpec", "rel_path": rows_rel_path},
             "partition_counts": {"name": "PartitionCountsComponentSpec", "counts": [len(ROWS)]},
         },
     }
@@ -374,6 +377,44 @@ def write_bad_codec_fixture(fixture_dir: Path):
     with gzip.open(rows_dir / "metadata.json.gz", "wb") as f:
         f.write(json.dumps(rows_metadata).encode("utf-8"))
 
+    top_metadata = {
+        "file_version": 1,
+        "table_type": "Table{global:Struct{},key:[],row:Struct{idx:Int64}}",
+        "components": {
+            "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
+            "partition_counts": {"name": "PartitionCountsComponentSpec", "counts": [0]},
+        },
+    }
+    with gzip.open(fixture_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(top_metadata).encode("utf-8"))
+
+
+def write_type_mismatch_fixture(fixture_dir: Path):
+    rows_dir = fixture_dir / "rows"
+    rows_dir.mkdir(parents=True, exist_ok=True)
+
+    rows_metadata = {
+        "_codecSpec": {
+            "_eType": "+EBaseStruct{idx:+EInt64}",
+            "_vType": "Struct{idx:Float64}",
+            "_bufferSpec": buffer_spec_chain("zstd"),
+        },
+        "_partFiles": [],
+    }
+    with gzip.open(rows_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(rows_metadata).encode("utf-8"))
+
+    top_metadata = {
+        "file_version": 1,
+        "table_type": "Table{global:Struct{},key:[],row:Struct{idx:Float64}}",
+        "components": {
+            "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
+            "partition_counts": {"name": "PartitionCountsComponentSpec", "counts": [0]},
+        },
+    }
+    with gzip.open(fixture_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(top_metadata).encode("utf-8"))
+
 
 if __name__ == "__main__":
     write_fixture(ROOT / "test" / "hailtable_fixture.ht", "zstd")
@@ -388,3 +429,7 @@ if __name__ == "__main__":
     print("Wrote", BAD_CODEC_FIXTURE_DIR)
     write_optional_array_fixture(OPTIONAL_ARRAY_FIXTURE_DIR, "zstd")
     print("Wrote", OPTIONAL_ARRAY_FIXTURE_DIR)
+    write_fixture(ALT_ROWS_FIXTURE_DIR, "zstd", rows_rel_path="rowdata")
+    print("Wrote", ALT_ROWS_FIXTURE_DIR)
+    write_type_mismatch_fixture(TYPE_MISMATCH_FIXTURE_DIR)
+    print("Wrote", TYPE_MISMATCH_FIXTURE_DIR)

@@ -104,9 +104,23 @@ SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz
 1
 2
 
+# --- Top-level metadata controls the row component relative path ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_alt_rows.ht');
+----
+3
+
 # --- Unknown codec name in the nested _bufferSpec chain fails at bind time ---
 
 statement error
 SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_bad_codec.ht');
 ----
 Unknown Hail codec
+
+# --- Mismatched logical/encoded row types fail at bind time ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_type_mismatch.ht');
+----
+Incompatible HailTable type metadata

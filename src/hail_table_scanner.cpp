@@ -21,6 +21,59 @@ namespace duckdb {
 
 using json = nlohmann::json;
 
+static void ReadExact(FileHandle &handle, void *buf, int64_t n, const std::string &path) {
+	int64_t total = 0;
+	while (total < n) {
+		int64_t got = handle.Read(static_cast<uint8_t *>(buf) + total, static_cast<idx_t>(n - total));
+		if (got == 0) {
+			throw IOException("Truncated read in HailTable metadata: " + path);
+		}
+		total += got;
+	}
+}
+
+static json ReadGzipJson(FileSystem &fs, const std::string &path) {
+	unique_ptr<FileHandle> handle;
+	try {
+		handle = fs.OpenFile(path, FileFlags::FILE_FLAGS_READ);
+	} catch (const std::exception &e) {
+		throw BinderException("Cannot open Hail table metadata: " + path + ": " + e.what());
+	}
+
+	int64_t file_size = fs.GetFileSize(*handle);
+	std::vector<uint8_t> gz_raw(static_cast<size_t>(file_size));
+	if (file_size > 0) {
+		ReadExact(*handle, gz_raw.data(), file_size, path);
+	}
+
+	std::string json_str = GZipFileSystem::UncompressGZIPString(
+	    reinterpret_cast<const char *>(gz_raw.data()), gz_raw.size());
+	try {
+		return json::parse(json_str);
+	} catch (const std::exception &e) {
+		throw BinderException("Failed to parse HailTable metadata at " + path + ": " + e.what());
+	}
+}
+
+static bool IsSafeRelativePath(const std::string &path) {
+	if (path.empty() || path[0] == '/' || path.find('\\') != std::string::npos) {
+		return false;
+	}
+	size_t start = 0;
+	while (start <= path.size()) {
+		size_t end = path.find('/', start);
+		std::string part = path.substr(start, end == std::string::npos ? std::string::npos : end - start);
+		if (part.empty() || part == "." || part == "..") {
+			return false;
+		}
+		if (end == std::string::npos) {
+			break;
+		}
+		start = end + 1;
+	}
+	return true;
+}
+
 static std::string ResolveCompressionCodecName(const json &buffer_spec) {
 	static const std::unordered_set<std::string> compression_codecs = {
 	    "ZstdBlockBufferSpec", "LZ4HCBlockBufferSpec", "LZ4FastBlockBufferSpec"};
@@ -38,6 +91,71 @@ static std::string ResolveCompressionCodecName(const json &buffer_spec) {
 		}
 		node = &node->at("child");
 	}
+}
+
+static void ValidateTypeCompatibility(const VTypeNode &vtype, const ETypeNode &etype, const std::string &path) {
+	auto incompatible = [&]() {
+		throw BinderException("Incompatible HailTable type metadata at " + path + ": VType " + vtype_to_string(vtype) +
+		                      " is not compatible with EType " + etype_to_string(etype));
+	};
+
+	switch (vtype.kind) {
+	case VKind::Int32:
+		if (etype.kind != EKind::Int32) {
+			incompatible();
+		}
+		return;
+	case VKind::Int64:
+		if (etype.kind != EKind::Int64) {
+			incompatible();
+		}
+		return;
+	case VKind::Float32:
+		if (etype.kind != EKind::Float32) {
+			incompatible();
+		}
+		return;
+	case VKind::Float64:
+		if (etype.kind != EKind::Float64) {
+			incompatible();
+		}
+		return;
+	case VKind::Boolean:
+		if (etype.kind != EKind::Boolean) {
+			incompatible();
+		}
+		return;
+	case VKind::String:
+		if (etype.kind != EKind::Binary) {
+			incompatible();
+		}
+		return;
+	case VKind::Array:
+		if (etype.kind != EKind::Array || vtype.children.size() != 1 || etype.children.size() != 1) {
+			incompatible();
+		}
+		ValidateTypeCompatibility(vtype.children[0], etype.children[0], path);
+		return;
+	case VKind::Struct:
+		if (etype.kind != EKind::BaseStruct || vtype.children.size() != etype.children.size()) {
+			incompatible();
+		}
+		for (idx_t i = 0; i < vtype.children.size(); i++) {
+			if (vtype.children[i].name != etype.children[i].name) {
+				incompatible();
+			}
+			ValidateTypeCompatibility(vtype.children[i], etype.children[i], path);
+		}
+		return;
+	case VKind::Locus:
+		if (etype.kind != EKind::BaseStruct || etype.children.size() != 2 ||
+		    etype.children[0].name != "contig" || etype.children[0].kind != EKind::Binary ||
+		    etype.children[1].name != "position" || etype.children[1].kind != EKind::Int32) {
+			incompatible();
+		}
+		return;
+	}
+	incompatible();
 }
 
 // ---------------------------------------------------------------------------
@@ -224,9 +342,10 @@ static void DecodeValue(const ETypeNode &etype, BlockDecoder &decoder, Vector &o
 
 struct HailTableBindData : public TableFunctionData {
 	std::string path;
+	std::string rows_rel_path;
 	ETypeNode etype; // top-level EBaseStruct, one child per output column, in order
 	std::string buffer_spec_name;
-	std::vector<std::string> part_files; // relative to <path>/rows/parts/
+	std::vector<std::string> part_files; // relative to <path>/<rows_rel_path>/parts/
 };
 
 // ---------------------------------------------------------------------------
@@ -274,27 +393,17 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	auto bind_data = make_uniq<HailTableBindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 
-	std::string meta_path = bind_data->path + "/rows/metadata.json.gz";
 	auto &fs = FileSystem::GetFileSystem(context);
-	unique_ptr<FileHandle> meta_handle;
-	try {
-		meta_handle = fs.OpenFile(meta_path, FileFlags::FILE_FLAGS_READ);
-	} catch (const std::exception &e) {
-		throw BinderException("Cannot open Hail table metadata: " + meta_path + ": " + e.what());
-	}
-	int64_t file_size = fs.GetFileSize(*meta_handle);
-	std::vector<uint8_t> gz_raw(static_cast<size_t>(file_size));
-	meta_handle->Read(gz_raw.data(), static_cast<idx_t>(file_size));
 
-	std::string json_str = GZipFileSystem::UncompressGZIPString(
-	    reinterpret_cast<const char *>(gz_raw.data()), gz_raw.size());
-
-	json meta;
-	try {
-		meta = json::parse(json_str);
-	} catch (const std::exception &e) {
-		throw BinderException("Failed to parse HailTable metadata at " + meta_path + ": " + e.what());
+	std::string table_meta_path = bind_data->path + "/metadata.json.gz";
+	json table_meta = ReadGzipJson(fs, table_meta_path);
+	bind_data->rows_rel_path = table_meta.at("components").at("rows").at("rel_path").get<std::string>();
+	if (!IsSafeRelativePath(bind_data->rows_rel_path)) {
+		throw BinderException("Invalid HailTable rows component path in metadata: " + bind_data->rows_rel_path);
 	}
+
+	std::string meta_path = bind_data->path + "/" + bind_data->rows_rel_path + "/metadata.json.gz";
+	json meta = ReadGzipJson(fs, meta_path);
 
 	// NOTE: schema lives at the ROOT of rows/metadata.json.gz under "_codecSpec" --
 	// there is no "rg"/"_RVDType" wrapper (that shape does not exist in real Hail
@@ -315,6 +424,7 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	if (vtype.kind != VKind::Struct || bind_data->etype.kind != EKind::BaseStruct) {
 		throw BinderException("HailTable row type must be a Struct at " + meta_path);
 	}
+	ValidateTypeCompatibility(vtype, bind_data->etype, meta_path);
 
 	for (auto &field : vtype.children) {
 		names.push_back(field.name);
@@ -379,7 +489,8 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 				break;
 			}
 			local_state.current_part = part_idx;
-			std::string part_path = bind_data.path + "/rows/parts/" + bind_data.part_files[part_idx];
+			std::string part_path = bind_data.path + "/" + bind_data.rows_rel_path + "/parts/" +
+			                        bind_data.part_files[part_idx];
 			auto &fs = FileSystem::GetFileSystem(context);
 			local_state.handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
 			local_state.decoder = make_decoder(bind_data.buffer_spec_name, *local_state.handle, part_path);
