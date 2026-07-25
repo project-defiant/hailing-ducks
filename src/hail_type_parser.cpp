@@ -32,8 +32,8 @@ public:
 
 	void expect(char c) {
 		if (eof() || s_[pos_] != c) {
-			throw std::runtime_error("Expected '" + std::string(1, c) + "' at position " +
-			                          std::to_string(pos_) + " in type string: " + s_);
+			throw std::runtime_error("Expected '" + std::string(1, c) + "' at position " + std::to_string(pos_) +
+			                         " in type string: " + s_);
 		}
 		pos_++;
 	}
@@ -53,7 +53,7 @@ public:
 		}
 		if (pos_ == start) {
 			throw std::runtime_error("Expected identifier at position " + std::to_string(start) +
-			                          " in type string: " + s_);
+			                         " in type string: " + s_);
 		}
 		return s_.substr(start, pos_ - start);
 	}
@@ -61,7 +61,7 @@ public:
 	void expect_eof() {
 		if (!eof()) {
 			throw std::runtime_error("Trailing characters at position " + std::to_string(pos_) +
-			                          " in type string: " + s_);
+			                         " in type string: " + s_);
 		}
 	}
 
@@ -286,8 +286,7 @@ LogicalType VTypeToDuckDBType(const VTypeNode &vtype) {
 	case VKind::String:
 		return LogicalType::VARCHAR;
 	case VKind::Locus:
-		return LogicalType::STRUCT(
-		    {{"contig", LogicalType::VARCHAR}, {"position", LogicalType::INTEGER}});
+		return LogicalType::STRUCT({{"contig", LogicalType::VARCHAR}, {"position", LogicalType::INTEGER}});
 	case VKind::Array:
 		return LogicalType::LIST(VTypeToDuckDBType(vtype.children[0]));
 	case VKind::Struct: {

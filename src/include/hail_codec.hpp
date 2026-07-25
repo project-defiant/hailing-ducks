@@ -101,8 +101,7 @@ private:
 	bool fill_block();
 };
 
-std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle,
-                                           const std::string &path);
+std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle, const std::string &path);
 
 // ---------------------------------------------------------------------------
 // SQL table functions (testing helpers)

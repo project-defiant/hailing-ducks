@@ -46,8 +46,8 @@ static json ReadGzipJson(FileSystem &fs, const std::string &path) {
 		ReadExact(*handle, gz_raw.data(), file_size, path);
 	}
 
-	std::string json_str = GZipFileSystem::UncompressGZIPString(
-	    reinterpret_cast<const char *>(gz_raw.data()), gz_raw.size());
+	std::string json_str =
+	    GZipFileSystem::UncompressGZIPString(reinterpret_cast<const char *>(gz_raw.data()), gz_raw.size());
 	try {
 		return json::parse(json_str);
 	} catch (const std::exception &e) {
@@ -75,10 +75,10 @@ static bool IsSafeRelativePath(const std::string &path) {
 }
 
 static std::string ResolveCompressionCodecName(const json &buffer_spec) {
-	static const std::unordered_set<std::string> compression_codecs = {
-	    "ZstdBlockBufferSpec", "LZ4HCBlockBufferSpec", "LZ4FastBlockBufferSpec"};
-	static const std::unordered_set<std::string> pass_through = {
-	    "LEB128BufferSpec", "BlockingBufferSpec", "StreamBlockBufferSpec"};
+	static const std::unordered_set<std::string> compression_codecs = {"ZstdBlockBufferSpec", "LZ4HCBlockBufferSpec",
+	                                                                   "LZ4FastBlockBufferSpec"};
+	static const std::unordered_set<std::string> pass_through = {"LEB128BufferSpec", "BlockingBufferSpec",
+	                                                             "StreamBlockBufferSpec"};
 
 	const json *node = &buffer_spec;
 	while (true) {
@@ -148,9 +148,9 @@ static void ValidateTypeCompatibility(const VTypeNode &vtype, const ETypeNode &e
 		}
 		return;
 	case VKind::Locus:
-		if (etype.kind != EKind::BaseStruct || etype.children.size() != 2 ||
-		    etype.children[0].name != "contig" || etype.children[0].kind != EKind::Binary ||
-		    etype.children[1].name != "position" || etype.children[1].kind != EKind::Int32) {
+		if (etype.kind != EKind::BaseStruct || etype.children.size() != 2 || etype.children[0].name != "contig" ||
+		    etype.children[0].kind != EKind::Binary || etype.children[1].name != "position" ||
+		    etype.children[1].kind != EKind::Int32) {
 			incompatible();
 		}
 		return;
@@ -443,15 +443,13 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	return std::move(bind_data);
 }
 
-static unique_ptr<GlobalTableFunctionState> HailTableInitGlobal(ClientContext &context,
-                                                                TableFunctionInitInput &input) {
+static unique_ptr<GlobalTableFunctionState> HailTableInitGlobal(ClientContext &context, TableFunctionInitInput &input) {
 	auto &bind_data = input.bind_data->Cast<HailTableBindData>();
 	return make_uniq<HailTableGlobalState>(bind_data.part_files.size());
 }
 
-static unique_ptr<LocalTableFunctionState> HailTableInitLocal(ExecutionContext &context,
-                                                               TableFunctionInitInput &input,
-                                                               GlobalTableFunctionState *) {
+static unique_ptr<LocalTableFunctionState> HailTableInitLocal(ExecutionContext &context, TableFunctionInitInput &input,
+                                                              GlobalTableFunctionState *) {
 	return make_uniq<HailTableLocalState>();
 }
 
@@ -489,8 +487,8 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 				break;
 			}
 			local_state.current_part = part_idx;
-			std::string part_path = bind_data.path + "/" + bind_data.rows_rel_path + "/parts/" +
-			                        bind_data.part_files[part_idx];
+			std::string part_path =
+			    bind_data.path + "/" + bind_data.rows_rel_path + "/parts/" + bind_data.part_files[part_idx];
 			auto &fs = FileSystem::GetFileSystem(context);
 			local_state.handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
 			local_state.decoder = make_decoder(bind_data.buffer_spec_name, *local_state.handle, part_path);

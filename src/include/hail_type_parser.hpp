@@ -17,10 +17,10 @@ enum class EKind { Int32, Int64, Float32, Float64, Boolean, Binary, Array, BaseS
 
 struct ETypeNode {
 	EKind kind;
-	bool required = false;        // meaningful only as a struct field / array element
-	std::string name;             // meaningful only as a struct field
+	bool required = false;           // meaningful only as a struct field / array element
+	std::string name;                // meaningful only as a struct field
 	std::vector<ETypeNode> children; // Array: exactly 1 (the element type)
-	                                  // BaseStruct: N, in field order
+	                                 // BaseStruct: N, in field order
 };
 
 // ---------------------------------------------------------------------------
@@ -34,8 +34,8 @@ enum class VKind { Int32, Int64, Float32, Float64, Boolean, String, Array, Struc
 
 struct VTypeNode {
 	VKind kind;
-	std::string name;             // meaningful only as a struct field
-	std::string genome;           // meaningful only for Locus, e.g. "GRCh37"
+	std::string name;                // meaningful only as a struct field
+	std::string genome;              // meaningful only for Locus, e.g. "GRCh37"
 	std::vector<VTypeNode> children; // Array: 1; Struct: N in field order
 };
 

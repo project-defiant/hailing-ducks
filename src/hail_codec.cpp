@@ -384,8 +384,7 @@ void Lz4BlockDecoder::skip_bytes(size_t n) {
 	}
 }
 
-std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle,
-                                           const std::string &path) {
+std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle, const std::string &path) {
 	if (codec_name == "ZstdBlockBufferSpec") {
 		return make_uniq<ZstdBlockDecoder>(handle, path);
 	}
