@@ -12,7 +12,7 @@ TEST_PATH=test/unittest.exe
 WINDOWS_TEST_PATTERN=$(subst ",,$(TESTS_BASE_DIRECTORY))*
 
 define RUN_WINDOWS_UNITTEST
-	cmd //C "copy /Y build\$(1)\src\*.dll build\$(1)\test\ >NUL 2>NUL & set PATH=%CD%\build\$(1)\src;%PATH%& build\$(1)\test\unittest.exe $(WINDOWS_TEST_PATTERN)"
+	powershell -NoLogo -NoProfile -ExecutionPolicy Bypass -Command "$$ErrorActionPreference = 'Stop'; Copy-Item -Force 'build/$(1)/src/*.dll' 'build/$(1)/test/' -ErrorAction SilentlyContinue; $$env:PATH = (Resolve-Path 'build/$(1)/src').Path + ';' + $$env:PATH; & 'build/$(1)/test/unittest.exe' '$(WINDOWS_TEST_PATTERN)'; exit $$LASTEXITCODE"
 endef
 
 test_release_internal:
