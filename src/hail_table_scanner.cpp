@@ -14,11 +14,31 @@
 #include <atomic>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 namespace duckdb {
 
 using json = nlohmann::json;
+
+static std::string ResolveCompressionCodecName(const json &buffer_spec) {
+	static const std::unordered_set<std::string> compression_codecs = {
+	    "ZstdBlockBufferSpec", "LZ4HCBlockBufferSpec", "LZ4FastBlockBufferSpec"};
+	static const std::unordered_set<std::string> pass_through = {
+	    "LEB128BufferSpec", "BlockingBufferSpec", "StreamBlockBufferSpec"};
+
+	const json *node = &buffer_spec;
+	while (true) {
+		std::string name = node->at("name").get<std::string>();
+		if (compression_codecs.count(name)) {
+			return name;
+		}
+		if (!pass_through.count(name) || !node->contains("child")) {
+			throw InvalidInputException("Unknown Hail codec: " + name);
+		}
+		node = &node->at("child");
+	}
+}
 
 // ---------------------------------------------------------------------------
 // SkipValue: consumes exactly the bytes a value of the given EType occupies,
@@ -27,7 +47,7 @@ using json = nlohmann::json;
 // for whatever comes after them in the row.
 // ---------------------------------------------------------------------------
 
-static void SkipValue(const ETypeNode &etype, ZstdBlockDecoder &decoder) {
+static void SkipValue(const ETypeNode &etype, BlockDecoder &decoder) {
 	switch (etype.kind) {
 	case EKind::Int32:
 		decoder.read_leb128_u32();
@@ -112,7 +132,7 @@ static void SkipValue(const ETypeNode &etype, ZstdBlockDecoder &decoder) {
 // LIST/STRUCT vector writes.
 // ---------------------------------------------------------------------------
 
-static void DecodeValue(const ETypeNode &etype, ZstdBlockDecoder &decoder, Vector &out, idx_t row) {
+static void DecodeValue(const ETypeNode &etype, BlockDecoder &decoder, Vector &out, idx_t row) {
 	switch (etype.kind) {
 	case EKind::Int32:
 		FlatVector::GetData<int32_t>(out)[row] = static_cast<int32_t>(decoder.read_leb128_u32());
@@ -153,6 +173,7 @@ static void DecodeValue(const ETypeNode &etype, ZstdBlockDecoder &decoder, Vecto
 struct HailTableBindData : public TableFunctionData {
 	std::string path;
 	ETypeNode etype; // top-level EBaseStruct, one child per output column, in order
+	std::string buffer_spec_name;
 	std::vector<std::string> part_files; // relative to <path>/rows/parts/
 };
 
@@ -175,7 +196,7 @@ struct HailTableGlobalState : public GlobalTableFunctionState {
 
 struct HailTableLocalState : public LocalTableFunctionState {
 	std::unique_ptr<FileHandle> handle;
-	std::unique_ptr<ZstdBlockDecoder> decoder;
+	std::unique_ptr<BlockDecoder> decoder;
 	idx_t current_part = idx_t(-1);
 	// Set when the per-row continuation flag reads 0 (see HailTableScan).
 	// This, not decoder->eof(), is the authoritative "no more rows" signal --
@@ -229,6 +250,7 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	auto &codec_spec = meta.at("_codecSpec");
 	std::string etype_str = codec_spec.at("_eType").get<std::string>();
 	std::string vtype_str = codec_spec.at("_vType").get<std::string>();
+	bind_data->buffer_spec_name = ResolveCompressionCodecName(codec_spec.at("_bufferSpec"));
 
 	VTypeNode vtype;
 	try {
@@ -246,11 +268,6 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 		names.push_back(field.name);
 		return_types.push_back(VTypeToDuckDBType(field));
 	}
-
-	// This task hardcodes ZstdBlockDecoder (matching Task 2's default "zstd"
-	// fixture) and does not yet read _bufferSpec at all -- Task 4 adds the
-	// nested-chain walk (_bufferSpec is NOT a flat {name, blockSize}; see
-	// Task 4) and dispatches between codecs via BlockDecoder/make_decoder().
 
 	for (auto &pf : meta.at("_partFiles")) {
 		std::string filename = pf.get<std::string>();
@@ -313,7 +330,7 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 			std::string part_path = bind_data.path + "/rows/parts/" + bind_data.part_files[part_idx];
 			auto &fs = FileSystem::GetFileSystem(context);
 			local_state.handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
-			local_state.decoder = make_uniq<ZstdBlockDecoder>(*local_state.handle, part_path);
+			local_state.decoder = make_decoder(bind_data.buffer_spec_name, *local_state.handle, part_path);
 			local_state.partition_done = false;
 		}
 

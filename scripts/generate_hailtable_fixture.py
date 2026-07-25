@@ -13,6 +13,8 @@ subprocess if the `zstandard` module isn't importable -- both produce
 standard zstd frames, so either is fine for ZstdBlockDecoder).
 """
 import gzip
+import ctypes
+import ctypes.util
 import json
 import shutil
 import struct
@@ -28,6 +30,9 @@ except ImportError:
 ROOT = Path(__file__).resolve().parent.parent
 FIXTURE_DIR = ROOT / "test" / "hailtable_fixture.ht"
 OPTIONAL_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_optional.ht"
+LZ4HC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4hc.ht"
+LZ4FAST_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_lz4fast.ht"
+BAD_CODEC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_bad_codec.ht"
 
 VTYPE = ("Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String],"
          "pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}")
@@ -112,14 +117,48 @@ def compress_zstd_payload(payload: bytes) -> bytes:
     return result.stdout
 
 
+def compress_lz4_payload(payload: bytes, codec: str) -> bytes:
+    try:
+        import lz4.block  # pip install lz4
+        mode = "high_compression" if codec == "lz4hc" else "default"
+        return lz4.block.compress(payload, mode=mode, store_size=False)
+    except ImportError:
+        pass
+
+    lib_name = ctypes.util.find_library("lz4")
+    if lib_name is None:
+        raise RuntimeError(
+            "Neither the 'lz4' python module nor system liblz4 is available "
+            "-- install one to generate LZ4-codec fixtures.")
+
+    lib = ctypes.CDLL(lib_name)
+    lib.LZ4_compressBound.argtypes = [ctypes.c_int]
+    lib.LZ4_compressBound.restype = ctypes.c_int
+    max_len = lib.LZ4_compressBound(len(payload))
+    out = ctypes.create_string_buffer(max_len)
+
+    src = ctypes.create_string_buffer(payload)
+    if codec == "lz4hc":
+        lib.LZ4_compress_HC.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+        lib.LZ4_compress_HC.restype = ctypes.c_int
+        n = lib.LZ4_compress_HC(src, out, len(payload), max_len, 9)
+    elif codec == "lz4fast":
+        lib.LZ4_compress_default.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+        lib.LZ4_compress_default.restype = ctypes.c_int
+        n = lib.LZ4_compress_default(src, out, len(payload), max_len)
+    else:
+        raise ValueError(codec)
+    if n <= 0:
+        raise RuntimeError("liblz4 failed to compress fixture payload")
+    return out.raw[:n]
+
+
 def build_part_file(rows, codec: str, encode_fn=encode_row) -> bytes:
     payload = encode_partition_body(rows, encode_fn)
     if codec == "zstd":
         compressed = compress_zstd_payload(payload)
     elif codec in ("lz4hc", "lz4fast"):
-        import lz4.block  # pip install lz4
-        mode = "high_compression" if codec == "lz4hc" else "default"
-        compressed = lz4.block.compress(payload, mode=mode, store_size=False)
+        compressed = compress_lz4_payload(payload, codec)
     else:
         raise ValueError(codec)
     inner = struct.pack("<i", len(payload)) + compressed  # decomp_size-prefixed inner frame
@@ -256,8 +295,41 @@ def write_fixture(fixture_dir: Path, codec: str):
         f.write(json.dumps(top_metadata).encode("utf-8"))
 
 
+def write_bad_codec_fixture(fixture_dir: Path):
+    rows_dir = fixture_dir / "rows"
+    rows_dir.mkdir(parents=True, exist_ok=True)
+
+    rows_metadata = {
+        "_codecSpec": {
+            "_eType": "+EBaseStruct{idx:+EInt64}",
+            "_vType": "Struct{idx:Int64}",
+            "_bufferSpec": {
+                "name": "LEB128BufferSpec",
+                "child": {
+                    "name": "BlockingBufferSpec",
+                    "blockSize": 32768,
+                    "child": {
+                        "name": "SomeUnknownSpec",
+                        "blockSize": 32768,
+                        "child": {"name": "StreamBlockBufferSpec"},
+                    },
+                },
+            },
+        },
+        "_partFiles": [],
+    }
+    with gzip.open(rows_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(rows_metadata).encode("utf-8"))
+
+
 if __name__ == "__main__":
     write_fixture(ROOT / "test" / "hailtable_fixture.ht", "zstd")
     print("Wrote", ROOT / "test" / "hailtable_fixture.ht")
     write_optional_fixture(OPTIONAL_FIXTURE_DIR, "zstd")
     print("Wrote", OPTIONAL_FIXTURE_DIR)
+    write_fixture(LZ4HC_FIXTURE_DIR, "lz4hc")
+    print("Wrote", LZ4HC_FIXTURE_DIR)
+    write_fixture(LZ4FAST_FIXTURE_DIR, "lz4fast")
+    print("Wrote", LZ4FAST_FIXTURE_DIR)
+    write_bad_codec_fixture(BAD_CODEC_FIXTURE_DIR)
+    print("Wrote", BAD_CODEC_FIXTURE_DIR)

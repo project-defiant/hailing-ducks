@@ -54,3 +54,38 @@ statement error
 SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/no_such.ht');
 ----
 Cannot open Hail table metadata
+
+# --- LZ4HC codec fallback: same row count and scalar values as Zstd ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4hc.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4hc.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- LZ4Fast codec fallback: same row count and scalar values as Zstd ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4fast.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4fast.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- Unknown codec name in the nested _bufferSpec chain fails at bind time ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_bad_codec.ht');
+----
+Unknown Hail codec
