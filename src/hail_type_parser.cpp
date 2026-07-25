@@ -186,46 +186,56 @@ VTypeNode parse_vtype(const std::string &s) {
 }
 
 std::string etype_to_string(const ETypeNode &node) {
+	std::string out;
+	// Emit '+' for this node's own required flag (applies at all nesting levels,
+	// including the top-level node)
+	if (node.required) {
+		out += "+";
+	}
 	switch (node.kind) {
 	case EKind::Int32:
-		return "EInt32";
+		out += "EInt32";
+		break;
 	case EKind::Int64:
-		return "EInt64";
+		out += "EInt64";
+		break;
 	case EKind::Float32:
-		return "EFloat32";
+		out += "EFloat32";
+		break;
 	case EKind::Float64:
-		return "EFloat64";
+		out += "EFloat64";
+		break;
 	case EKind::Boolean:
-		return "EBoolean";
+		out += "EBoolean";
+		break;
 	case EKind::Binary:
-		return "EBinary";
+		out += "EBinary";
+		break;
 	case EKind::Array: {
-		std::string out = "EArray[";
-		if (node.children[0].required) {
-			out += "+";
-		}
+		out += "EArray[";
+		// Recursively serialize the element; it will emit its own '+' if required
 		out += etype_to_string(node.children[0]);
 		out += "]";
-		return out;
+		break;
 	}
 	case EKind::BaseStruct: {
-		std::string out = "EBaseStruct{";
+		out += "EBaseStruct{";
 		for (size_t i = 0; i < node.children.size(); i++) {
 			if (i > 0) {
 				out += ",";
 			}
 			auto &f = node.children[i];
 			out += f.name + ":";
-			if (f.required) {
-				out += "+";
-			}
+			// Recursively serialize the field; it will emit its own '+' if required
 			out += etype_to_string(f);
 		}
 		out += "}";
-		return out;
+		break;
 	}
+	default:
+		throw std::runtime_error("Unhandled EKind in etype_to_string");
 	}
-	throw std::runtime_error("Unhandled EKind in etype_to_string");
+	return out;
 }
 
 std::string vtype_to_string(const VTypeNode &node) {

@@ -12,6 +12,11 @@ SELECT hail_debug_etype('EInt32');
 EInt32
 
 query I
+SELECT hail_debug_etype('+EInt32');
+----
++EInt32
+
+query I
 SELECT hail_debug_etype('EArray[+EBinary]');
 ----
 EArray[+EBinary]
@@ -20,6 +25,11 @@ query I
 SELECT hail_debug_etype('EBaseStruct{contig:+EBinary,position:+EInt32}');
 ----
 EBaseStruct{contig:+EBinary,position:+EInt32}
+
+query I
+SELECT hail_debug_etype('+EBaseStruct{contig:+EBinary}');
+----
++EBaseStruct{contig:+EBinary}
 
 query I
 SELECT hail_debug_etype('EBaseStruct{idx:+EInt64,locus:+EBaseStruct{contig:+EBinary,position:+EInt32},alleles:+EArray[+EBinary],pop_freq:+EBaseStruct{AC:+EInt32,AF:+EFloat64,AN:+EInt32,homozygote_count:+EInt32}}');
