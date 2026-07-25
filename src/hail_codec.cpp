@@ -8,7 +8,7 @@
 // Use zstd bundled with DuckDB (duckdb_zstd namespace)
 #include "zstd.h"
 
-#include <lz4.h>
+#include "lz4.hpp"
 
 #include <cstring>
 #include <stdexcept>
@@ -262,8 +262,9 @@ bool Lz4BlockDecoder::fill_block() {
 	}
 
 	block_buf_.resize(static_cast<size_t>(decomp_size));
-	int ret = LZ4_decompress_safe(reinterpret_cast<const char *>(raw.data() + 4),
-	                              reinterpret_cast<char *>(block_buf_.data()), stream_block_len - 4, decomp_size);
+	int ret =
+	    duckdb_lz4::LZ4_decompress_safe(reinterpret_cast<const char *>(raw.data() + 4),
+	                                    reinterpret_cast<char *>(block_buf_.data()), stream_block_len - 4, decomp_size);
 	if (ret != decomp_size) {
 		throw std::runtime_error("LZ4 decompression failed in: " + path_);
 	}

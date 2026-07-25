@@ -11,18 +11,6 @@ list(APPEND CMAKE_PREFIX_PATH /opt/homebrew)
 # Note that it should also be removed from vcpkg.json to prevent needlessly installing it..
 find_package(OpenSSL REQUIRED)
 
-# lz4: try cmake config first (vcpkg), fall back to plain find_path/find_library (Homebrew)
-find_package(lz4 CONFIG QUIET)
-if(NOT lz4_FOUND)
-    find_path(LZ4_INCLUDE_DIR lz4.h REQUIRED)
-    find_library(LZ4_LIBRARY NAMES lz4 liblz4 REQUIRED)
-    add_library(lz4::lz4 UNKNOWN IMPORTED)
-    set_target_properties(lz4::lz4 PROPERTIES
-        IMPORTED_LOCATION "${LZ4_LIBRARY}"
-        INTERFACE_INCLUDE_DIRECTORIES "${LZ4_INCLUDE_DIR}"
-    )
-endif()
-
 # nlohmann-json: header-only, try cmake config (vcpkg/Homebrew) then fall back to downloading the single header
 find_package(nlohmann_json CONFIG QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -51,7 +39,7 @@ set(EXTENSION_NAME ${TARGET_NAME}_extension)
 set(LOADABLE_EXTENSION_NAME ${TARGET_NAME}_loadable_extension)
 
 project(${TARGET_NAME})
-include_directories(src/include)
+include_directories(src/include duckdb/third_party/lz4 ${OPENSSL_INCLUDE_DIR})
 
 set(EXTENSION_SOURCES
     src/quack_extension.cpp
@@ -61,12 +49,15 @@ set(EXTENSION_SOURCES
     src/hail_table_scanner.cpp
 )
 
+if(NOT CLANG_TIDY)
+    set(EXTENSION_SOURCES ${EXTENSION_SOURCES} duckdb/third_party/lz4/lz4.cpp)
+endif()
+
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
 
-# Link dependencies in both the static library and the loadable extension
-target_link_libraries(${EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} OpenSSL::SSL OpenSSL::Crypto lz4::lz4 nlohmann_json::nlohmann_json)
+target_link_libraries(${EXTENSION_NAME} nlohmann_json::nlohmann_json)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} nlohmann_json::nlohmann_json)
 
 install(
   TARGETS ${EXTENSION_NAME}
