@@ -3,6 +3,7 @@
 #include "quack_extension.hpp"
 #include "hail_blockmatrix_scanner.hpp"
 #include "hail_codec.hpp"
+#include "hail_table_scanner.hpp"
 #include "hail_type_parser.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
@@ -66,6 +67,7 @@ static void LoadInternal(ExtensionLoader &loader) {
 	// Register Hail table scan functions
 	HailBlockMatrixScanFunction::Register(loader);
 	HailCodecScanFunction::Register(loader);
+	HailTableScanFunction::Register(loader);
 }
 
 void QuackExtension::Load(ExtensionLoader &loader) {

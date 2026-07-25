@@ -1,0 +1,44 @@
+# name: test/sql/hail_table.test
+# description: HailTable (.ht) scanner integration tests
+# group: [sql]
+
+require quack
+
+require-env HAILING_DUCKS_ROOT
+
+# --- Row count and flat scalar field ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- Nested fields not yet decoded: present in schema, NULL at scan time ---
+
+query I
+SELECT locus IS NULL FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+true
+true
+true
+
+query I
+SELECT alleles IS NULL FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+true
+true
+true
+
+# --- Error: path does not contain rows/metadata.json.gz ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/no_such.ht');
+----
+Cannot open Hail table metadata

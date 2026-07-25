@@ -58,6 +58,7 @@ set(EXTENSION_SOURCES
     src/hail_blockmatrix_scanner.cpp
     src/hail_codec.cpp
     src/hail_type_parser.cpp
+    src/hail_table_scanner.cpp
 )
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
