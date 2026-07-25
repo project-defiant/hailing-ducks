@@ -53,18 +53,26 @@ static void SkipValue(const ETypeNode &etype, ZstdBlockDecoder &decoder) {
 		uint32_t len = decoder.read_leb128_u32();
 		const ETypeNode &elem = etype.children[0];
 		if (!elem.required) {
-			size_t n_missing_bytes = (len + 7) / 8;
-			decoder.skip_bytes(n_missing_bytes);
-			// NOTE: without decoding the missing bits we cannot tell which
-			// elements are actually present vs NULL, but every element still
-			// occupies 0 bytes when NULL and its full encoding when present.
-			// Since this fixture and phase never emit optional elements,
-			// Task 3 does not attempt to skip-with-nulls correctly here —
-			// Task 5 replaces this whole branch with real decode logic
-			// before any fixture with optional array elements is added.
-		}
-		for (uint32_t i = 0; i < len; i++) {
-			SkipValue(elem, decoder);
+			// Same missing-bit protocol as BaseStruct below, but per-element: a
+			// NULL element occupies zero bytes on the wire, so the bits must be
+			// read and consulted -- calling SkipValue unconditionally for every
+			// element (including NULL ones) would over-read into the next
+			// element/field/row.
+			size_t n_missing_bytes = (static_cast<size_t>(len) + 7) / 8;
+			std::vector<uint8_t> missing_bits(n_missing_bytes);
+			if (n_missing_bytes > 0) {
+				decoder.read_bytes(missing_bits.data(), n_missing_bytes);
+			}
+			for (uint32_t i = 0; i < len; i++) {
+				bool is_null = (missing_bits[i / 8] >> (i % 8)) & 1;
+				if (!is_null) {
+					SkipValue(elem, decoder);
+				}
+			}
+		} else {
+			for (uint32_t i = 0; i < len; i++) {
+				SkipValue(elem, decoder);
+			}
 		}
 		return;
 	}
@@ -280,6 +288,21 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 	idx_t out_row = 0;
 	const idx_t capacity = STANDARD_VECTOR_SIZE;
 
+	// The row struct (bind_data.etype) is structurally just a BaseStruct like any
+	// nested one -- if it has optional top-level fields, Hail's wire format
+	// requires a ceil(n_optional/8)-byte missing-bit prefix to be read and
+	// consulted before decoding the fields, exactly as SkipValue's BaseStruct
+	// case already does for nested structs. Compute this once (bind_data.etype
+	// doesn't change across rows) and reuse the scratch buffer per row.
+	int n_optional_fields = 0;
+	for (auto &f : bind_data.etype.children) {
+		if (!f.required) {
+			n_optional_fields++;
+		}
+	}
+	size_t n_missing_bytes = (static_cast<size_t>(n_optional_fields) + 7) / 8;
+	std::vector<uint8_t> missing_bits(n_missing_bytes);
+
 	while (out_row < capacity) {
 		if (!local_state.HasPartition() || local_state.Done()) {
 			idx_t part_idx = global_state.next_part.fetch_add(1);
@@ -305,8 +328,22 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 				local_state.partition_done = true;
 				break;
 			}
+			if (n_missing_bytes > 0) {
+				local_state.decoder->read_bytes(missing_bits.data(), n_missing_bytes);
+			}
+			int optional_idx = 0;
 			for (idx_t col = 0; col < output.ColumnCount(); col++) {
-				DecodeValue(bind_data.etype.children[col], *local_state.decoder, output.data[col], out_row);
+				const auto &field = bind_data.etype.children[col];
+				bool is_null = false;
+				if (!field.required) {
+					is_null = (missing_bits[optional_idx / 8] >> (optional_idx % 8)) & 1;
+					optional_idx++;
+				}
+				if (is_null) {
+					FlatVector::SetNull(output.data[col], out_row, true);
+				} else {
+					DecodeValue(field, *local_state.decoder, output.data[col], out_row);
+				}
 			}
 			out_row++;
 		}

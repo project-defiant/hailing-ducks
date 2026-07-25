@@ -36,6 +36,18 @@ true
 true
 true
 
+# --- Optional top-level field: row struct's own missing-bit prefix must be
+# read before decoding its fields (regression test for task-3 fix Important
+# #2 -- see hailtable_fixture_optional.ht, whose 'qual' field is optional at
+# the top level, unlike the main fixture where every field is required) ---
+
+query II
+SELECT idx, qual FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_optional.ht') ORDER BY idx;
+----
+0	1.500000
+1	NULL
+2	3.250000
+
 # --- Error: path does not contain rows/metadata.json.gz ---
 
 statement error
