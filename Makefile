@@ -7,6 +7,10 @@ EXT_CONFIG=${PROJ_DIR}extension_config.cmake
 # Include the Makefile from extension-ci-tools
 include extension-ci-tools/makefiles/duckdb_extension.Makefile
 
+ifneq (,$(filter windows_%,$(DUCKDB_PLATFORM)))
+	TEST_PATH=test/unittest.exe
+endif
+
 # Export the project root so SQLLogicTests can substitute ${HAILING_DUCKS_ROOT} in path expressions
 export HAILING_DUCKS_ROOT := $(CURDIR)
 
