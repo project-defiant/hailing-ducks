@@ -7,11 +7,11 @@ FROM hail_ld_status_codes()
 ORDER BY status_domain, status_code
 LIMIT 5;
 ----
-variant	0	resolved_exact
-variant	1	resolved_flipped
-variant	2	not_found_in_ht
-variant	3	outside_locus
-variant	4	ambiguous_in_ht
+bm	0	bm_resolved
+bm	1	bm_missing_in_ht
+bm	2	bm_index_out_of_bounds
+bm	3	bm_missing_block
+bm	4	bm_missing_or_nan
 
 # Test preflight accepts inline string and dedupes
 # Input format: 'locus1|chr1:1000-2000|chr1_1001_A_G,chr1_1002_C_T,chr1_1001_A_G'
