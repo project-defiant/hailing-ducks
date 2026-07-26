@@ -78,81 +78,73 @@ static unique_ptr<GlobalTableFunctionState> HailLDPreflightInitGlobal(ClientCont
     return make_uniq<GlobalTableFunctionState>();
 }
 
+struct PreflightLocalState : public LocalTableFunctionState {
+    // buffered output rows for this local scan
+    struct OutRow { std::string locus_id; std::string req; int32_t code; };
+    std::vector<OutRow> rows;
+    idx_t next = 0;
+};
+
 static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionContext &context,
                                                                    TableFunctionInitInput &input,
                                                                    GlobalTableFunctionState *) {
-    return make_uniq<LocalTableFunctionState>();
-}
-
-static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    // For now, accept a single VARCHAR input captured at bind time in PreflightBindData
-    auto &bind_data = data.bind_data->Cast<PreflightBindData>();
-    std::string s = bind_data.request_arg;
-    fprintf(stderr, "[hail_ld_preflight] called with arg='%s'\n", s.c_str());
+    auto state = make_uniq<PreflightLocalState>();
+    // parse bind-time request_arg into rows, store in local state for chunked emission
+    auto &bind = input.bind_data->Cast<PreflightBindData>();
+    std::string s = bind.request_arg;
     if (s.empty()) {
-        output.SetCardinality(0);
-        return;
+        return std::move(state);
     }
-    // Expect format: locus_id|locus|var1,var2,var3
     auto parts = StringUtil::Split(s, "|");
     if (parts.size() != 3) {
-        // Emit nothing for malformed for now
-        output.SetCardinality(0);
-        return;
+        return std::move(state);
     }
     std::string locus_id = parts[0];
-    std::string locus = parts[1];
     std::string varlist = parts[2];
     auto vars = StringUtil::Split(varlist, ",");
 
-    // Simple biallelic pattern: contig_pos_ref_alt
-    for (size_t i = 0; i < vars.size(); ++i) {
-        std::string v = vars[i];
-        // naive validation: contains '_' twice
+    std::unordered_set<std::string> seen;
+    for (auto &v : vars) {
+        if (seen.count(v)) continue;
+        seen.insert(v);
+        // validate pattern quickly: must contain at least two '_'
         size_t p1 = v.find('_');
         size_t p2 = v.find_last_of('_');
         if (p1 == std::string::npos || p2 == p1) {
-            // unsupported_variant_id -> code 5
-            auto &locus_vec = output.data[0];
-            auto &req_vec = output.data[1];
-            auto &dom_vec = output.data[2];
-            auto &code_vec = output.data[3];
-            StringVector::AddString(locus_vec, locus_id);
-            StringVector::AddString(req_vec, v);
-            StringVector::AddString(dom_vec, "variant");
-            // set code at index 0
-            FlatVector::GetData<int32_t>(code_vec)[0] = 5;
-            output.SetCardinality(1);
-            return;
+            state->rows.push_back({locus_id, v, 5}); // unsupported_variant_id
+        } else {
+            state->rows.push_back({locus_id, v, 0}); // resolved_exact for TDD
         }
     }
+    return std::move(state);
+}
 
-    // If all OK, emit resolved_exact (code 0) for every unique var
-    struct OutRow { std::string locus_id; std::string req; int32_t code; };
-    std::unordered_set<std::string> seen;
-    std::vector<OutRow> rows;
-    for (auto &v : vars) {
-        if (seen.count(v)) {
-            continue; // dedupe
-        }
-        seen.insert(v);
-        rows.push_back({locus_id, v, 0});
+static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+    auto local = (PreflightLocalState *)data.local_state;
+    if (!local || local->next >= local->rows.size()) {
+        // no data left
+        output.SetCardinality(0);
+        return;
     }
+    const idx_t capacity = STANDARD_VECTOR_SIZE;
+    idx_t to_emit = std::min<idx_t>(capacity, (idx_t)(local->rows.size() - local->next));
 
-    // Write rows into the output vectors
     auto &locus_vec = output.data[0];
     auto &req_vec = output.data[1];
     auto &dom_vec = output.data[2];
     auto &code_vec = output.data[3];
 
-    for (idx_t i = 0; i < (idx_t)rows.size(); ++i) {
-        StringVector::AddString(locus_vec, rows[i].locus_id);
-        StringVector::AddString(req_vec, rows[i].req);
+    for (idx_t i = 0; i < to_emit; ++i) {
+        auto &r = local->rows[local->next + i];
+        StringVector::AddString(locus_vec, r.locus_id);
+        StringVector::AddString(req_vec, r.req);
         StringVector::AddString(dom_vec, "variant");
-        FlatVector::GetData<int32_t>(code_vec)[i] = rows[i].code;
+        FlatVector::GetData<int32_t>(code_vec)[i] = r.code;
     }
-    output.SetCardinality((idx_t)rows.size());
+    local->next += to_emit;
+    output.SetCardinality(to_emit);
 }
+
 
 void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
     fprintf(stderr, "[hail_ld] RegisterHailLDQueryFunctions called\n");
