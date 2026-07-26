@@ -1,18 +1,32 @@
--- require quack
+require quack
 
--- Test hail_ld_status_codes returns known codes
+# Test hail_ld_status_codes returns known codes
+query I
 SELECT status_domain, status_code, status_name
 FROM hail_ld_status_codes()
 ORDER BY status_domain, status_code
 LIMIT 5;
+----
+variant	0	resolved_exact
+variant	1	resolved_flipped
+variant	2	not_found_in_ht
+variant	3	outside_locus
+variant	4	ambiguous_in_ht
 
--- Test preflight accepts inline string and dedupes
--- Input format: 'locus1|chr1:1000-2000|chr1_1001_A_G,chr1_1002_C_T,chr1_1001_A_G'
+# Test preflight accepts inline string and dedupes
+# Input format: 'locus1|chr1:1000-2000|chr1_1001_A_G,chr1_1002_C_T,chr1_1001_A_G'
+query I
 SELECT locus_id, requested_variant_id, status_code
 FROM hail_ld_preflight('locus1|chr1:1000-2000|chr1_1001_A_G,chr1_1002_C_T,chr1_1001_A_G')
 ORDER BY requested_variant_id;
+----
+locus1	chr1_1001_A_G	0
+locus1	chr1_1002_C_T	0
 
--- Test preflight rejects malformed variant id
+# Test preflight rejects malformed variant id
+query I
 SELECT locus_id, requested_variant_id, status_code
 FROM hail_ld_preflight('locus1|chr1:1000-2000|badvariant')
 LIMIT 1;
+----
+locus1	badvariant	5
