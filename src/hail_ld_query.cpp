@@ -15,6 +15,7 @@ namespace duckdb {
 
 // Simple status codes table function: hail_ld_status_codes()
 static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+    fprintf(stderr, "[hail_ld] HailLDStatusCodes called\n");
     // schema: status_domain, status_code, status_name, description
     const idx_t capacity = STANDARD_VECTOR_SIZE;
     idx_t out_row = 0;
