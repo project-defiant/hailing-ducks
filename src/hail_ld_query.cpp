@@ -120,14 +120,14 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
 }
 
 static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    auto local = (PreflightLocalState *)data.local_state;
-    if (!local || local->next >= local->rows.size()) {
+    auto &local = data.local_state->Cast<PreflightLocalState>();
+    if (local.next >= local.rows.size()) {
         // no data left
         output.SetCardinality(0);
         return;
     }
     const idx_t capacity = STANDARD_VECTOR_SIZE;
-    idx_t to_emit = std::min<idx_t>(capacity, (idx_t)(local->rows.size() - local->next));
+    idx_t to_emit = std::min<idx_t>(capacity, (idx_t)(local.rows.size() - local.next));
 
     auto &locus_vec = output.data[0];
     auto &req_vec = output.data[1];
@@ -135,13 +135,13 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
     auto &code_vec = output.data[3];
 
     for (idx_t i = 0; i < to_emit; ++i) {
-        auto &r = local->rows[local->next + i];
+        auto &r = local.rows[local.next + i];
         StringVector::AddString(locus_vec, r.locus_id);
         StringVector::AddString(req_vec, r.req);
         StringVector::AddString(dom_vec, "variant");
         FlatVector::GetData<int32_t>(code_vec)[i] = r.code;
     }
-    local->next += to_emit;
+    local.next += to_emit;
     output.SetCardinality(to_emit);
 }
 
