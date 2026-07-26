@@ -15,7 +15,6 @@ namespace duckdb {
 
 // Simple status codes table function: hail_ld_status_codes()
 static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    auto &types = output.GetTypes();
     // schema: status_domain, status_code, status_name, description
     const idx_t capacity = STANDARD_VECTOR_SIZE;
     idx_t out_row = 0;
@@ -38,22 +37,18 @@ static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, 
     };
 
     idx_t n = sizeof(statuses) / sizeof(statuses[0]);
-    out_row = 0;
-    while (out_row < n && out_row < capacity) {
-        // Fill output vectors
-        auto &domain_vec = output.data[0];
-        auto &code_vec = output.data[1];
-        auto &name_vec = output.data[2];
-        auto &desc_vec = output.data[3];
+    // Fill output vectors
+    auto &domain_vec = output.data[0];
+    auto &code_vec = output.data[1];
+    auto &name_vec = output.data[2];
+    auto &desc_vec = output.data[3];
 
-        for (idx_t i = 0; i < n && i < capacity; ++i) {
-            StringVector::AddString(domain_vec, statuses[i].domain);
-            FlatVector::GetData<int32_t>(code_vec)[i] = statuses[i].code;
-            StringVector::AddString(name_vec, statuses[i].name);
-            StringVector::AddString(desc_vec, statuses[i].desc);
-            out_row++;
-        }
-        break;
+    for (idx_t i = 0; i < n && i < capacity; ++i) {
+        StringVector::AddString(domain_vec, statuses[i].domain);
+        FlatVector::GetData<int32_t>(code_vec)[i] = statuses[i].code;
+        StringVector::AddString(name_vec, statuses[i].name);
+        StringVector::AddString(desc_vec, statuses[i].desc);
+        out_row++;
     }
     output.SetCardinality(out_row);
 }
@@ -62,7 +57,7 @@ static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, 
 // For TDD: implement basic parsing and status emission without HT/BM resolution.
 
 struct PreflightBindData : public TableFunctionData {
-    // nothing for now
+    std::string request_arg;
 };
 
 static unique_ptr<FunctionData> HailLDPreflightBind(ClientContext &context, TableFunctionBindInput &input,
@@ -70,7 +65,11 @@ static unique_ptr<FunctionData> HailLDPreflightBind(ClientContext &context, Tabl
     // Output schema (variant status event): locus_id, requested_variant_id, status_domain, status_code
     names = {"locus_id", "requested_variant_id", "status_domain", "status_code"};
     return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
-    return make_uniq<PreflightBindData>();
+    auto bind_data = make_uniq<PreflightBindData>();
+    if (!input.inputs.empty()) {
+        bind_data->request_arg = input.inputs[0].GetValue<string>();
+    }
+    return std::move(bind_data);
 }
 
 static unique_ptr<GlobalTableFunctionState> HailLDPreflightInitGlobal(ClientContext &context,
@@ -85,17 +84,13 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
 }
 
 static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    // For now, accept a single VARCHAR input: requests_path (Parquet file) OR allow inline via single-row input
-    // For TDD, if input is a single inline row with locus and variant_ids, parse simple CSV like 'locus_id|locus|a,b,c'
-
-    if (data.inputs.size() == 0) {
-        // No inputs: empty output
+    // For now, accept a single VARCHAR input captured at bind time in PreflightBindData
+    auto &bind_data = data.bind_data->Cast<PreflightBindData>();
+    std::string s = bind_data.request_arg;
+    if (s.empty()) {
         output.SetCardinality(0);
         return;
     }
-
-    auto arg = data.inputs[0].GetValue<string>();
-    std::string s = arg;
     // Expect format: locus_id|locus|var1,var2,var3
     auto parts = StringUtil::Split(s, "|");
     if (parts.size() != 3) {
@@ -116,7 +111,6 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
         size_t p2 = v.find_last_of('_');
         if (p1 == std::string::npos || p2 == p1) {
             // unsupported_variant_id -> code 5
-            idx_t out_row = 0;
             auto &locus_vec = output.data[0];
             auto &req_vec = output.data[1];
             auto &dom_vec = output.data[2];
@@ -124,7 +118,8 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
             StringVector::AddString(locus_vec, locus_id);
             StringVector::AddString(req_vec, v);
             StringVector::AddString(dom_vec, "variant");
-            FlatVector::GetData<int32_t>(code_vec)[out_row] = 5;
+            // set code at index 0
+            FlatVector::GetData<int32_t>(code_vec)[0] = 5;
             output.SetCardinality(1);
             return;
         }
@@ -138,23 +133,36 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
             continue; // dedupe
         }
         seen.insert(v);
-        auto &locus_vec = output.data[0];
-        auto &req_vec = output.data[1];
-        auto &dom_vec = output.data[2];
-        auto &code_vec = output.data[3];
-        StringVector::AddString(locus_vec, locus_id);
-        StringVector::AddString(req_vec, v);
-        StringVector::AddString(dom_vec, "variant");
-        FlatVector::GetData<int32_t>(code_vec)[out_idx] = 0;
-        out_idx++;
+        rows.push_back({locus_id, v, 0});
     }
-    output.SetCardinality(out_idx);
+
+    // Write rows into the output vectors
+    auto &locus_vec = output.data[0];
+    auto &req_vec = output.data[1];
+    auto &dom_vec = output.data[2];
+    auto &code_vec = output.data[3];
+
+    for (idx_t i = 0; i < (idx_t)rows.size(); ++i) {
+        StringVector::AddString(locus_vec, rows[i].locus_id);
+        StringVector::AddString(req_vec, rows[i].req);
+        StringVector::AddString(dom_vec, "variant");
+        FlatVector::GetData<int32_t>(code_vec)[i] = rows[i].code;
+    }
+    output.SetCardinality((idx_t)rows.size());
 }
 
 void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
-    // status codes table function
-    TableFunction status_func("hail_ld_status_codes", {}, HailLDStatusCodes);
-    status_func.null_handling = FunctionNullHandling::SPECIAL_HANDLING;
+    // status codes table function with explicit bind
+    TableFunction status_func("hail_ld_status_codes", {}, HailLDStatusCodes, nullptr, nullptr);
+    // Provide a bind that sets output schema
+    // Implement bind as lambda capturing nothing
+    status_func = TableFunction("hail_ld_status_codes", {}, HailLDStatusCodes, 
+        [](ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) -> unique_ptr<FunctionData> {
+            names = {"status_domain", "status_code", "status_name", "description"};
+            return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR};
+            return nullptr;
+        }
+    );
     loader.RegisterFunction(status_func);
 
     // preflight function (simple string inline for TDD)
@@ -162,5 +170,6 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
                                 HailLDPreflightBind, HailLDPreflightInitGlobal, HailLDPreflightInitLocal);
     loader.RegisterFunction(preflight_func);
 }
+
 
 } // namespace duckdb
