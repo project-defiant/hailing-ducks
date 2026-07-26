@@ -1,6 +1,6 @@
 require quack
 
--- Edge cases for hail_ld_preflight
+# Edge cases for hail_ld_preflight
 
 # 1) Empty input should return zero rows
 query I
