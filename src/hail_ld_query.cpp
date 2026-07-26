@@ -87,6 +87,7 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
     // For now, accept a single VARCHAR input captured at bind time in PreflightBindData
     auto &bind_data = data.bind_data->Cast<PreflightBindData>();
     std::string s = bind_data.request_arg;
+    fprintf(stderr, "[hail_ld_preflight] called with arg='%s'\n", s.c_str());
     if (s.empty()) {
         output.SetCardinality(0);
         return;
@@ -126,8 +127,9 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
     }
 
     // If all OK, emit resolved_exact (code 0) for every unique var
+    struct OutRow { std::string locus_id; std::string req; int32_t code; };
     std::unordered_set<std::string> seen;
-    idx_t out_idx = 0;
+    std::vector<OutRow> rows;
     for (auto &v : vars) {
         if (seen.count(v)) {
             continue; // dedupe
