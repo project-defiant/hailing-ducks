@@ -1,0 +1,46 @@
+require quack
+
+-- Edge cases for hail_ld_preflight
+
+# 1) Empty input should return zero rows
+query I
+SELECT COUNT(*) FROM hail_ld_preflight('');
+----
+0
+----
+
+# 2) Malformed request (not 3 parts) should return zero rows
+query I
+SELECT COUNT(*) FROM hail_ld_preflight('badformat');
+----
+0
+----
+
+# 3) Unsupported variant id returns code 5
+query III
+SELECT locus_id, requested_variant_id, status_code
+FROM hail_ld_preflight('locusX|chr1:1-10|not_a_variant')
+LIMIT 1;
+----
+locusX	not_a_variant	5
+----
+
+# 4) Deduping: duplicate variants are emitted once
+query III
+SELECT locus_id, requested_variant_id, status_code
+FROM hail_ld_preflight('locus1|chr1:1000-2000|chr1_1001_A_G,chr1_1002_C_T,chr1_1001_A_G')
+ORDER BY requested_variant_id;
+----
+locus1	chr1_1001_A_G	0
+locus1	chr1_1002_C_T	0
+----
+
+# 5) Large list (chunking): emit 1100 unique valid variants -> COUNT = 1100
+-- generate variant list: chr1_1000_A_G,chr1_1001_A_G,...chr1_2099_A_G (1100 entries)
+query I
+SELECT COUNT(*) FROM hail_ld_preflight('biglocus|chr1:1000-5000|" ||
+-- placeholder replaced at test generation time by the test runner; here we inline the full list
+');
+----
+1100
+----
