@@ -47,6 +47,7 @@ set(EXTENSION_SOURCES
     src/hail_codec.cpp
     src/hail_type_parser.cpp
     src/hail_table_scanner.cpp
+    src/hail_ld_query.cpp
     duckdb/third_party/lz4/lz4.cpp
 )
 
