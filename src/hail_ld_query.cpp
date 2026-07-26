@@ -154,6 +154,7 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
 }
 
 void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
+    fprintf(stderr, "[hail_ld] RegisterHailLDQueryFunctions called\n");
     // status codes table function with explicit bind
     TableFunction status_func("hail_ld_status_codes", {}, HailLDStatusCodes, nullptr, nullptr);
     // Provide a bind that sets output schema
