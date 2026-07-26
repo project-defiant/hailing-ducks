@@ -8,6 +8,8 @@
 // Use zstd bundled with DuckDB (duckdb_zstd namespace)
 #include "zstd.h"
 
+#include "lz4.hpp"
+
 #include <cstring>
 #include <stdexcept>
 #include <string>
@@ -216,6 +218,181 @@ void ZstdBlockDecoder::skip_bytes(size_t n) {
 			fill_block();
 		}
 	}
+}
+
+bool Lz4BlockDecoder::read_exact_raw(void *buf, int64_t n) {
+	int64_t total = 0;
+	while (total < n) {
+		int64_t got = handle_.Read(static_cast<uint8_t *>(buf) + total, static_cast<idx_t>(n - total));
+		if (got == 0) {
+			if (total == 0) {
+				return false;
+			}
+			throw std::runtime_error("Truncated read in: " + path_);
+		}
+		total += got;
+	}
+	return true;
+}
+
+bool Lz4BlockDecoder::fill_block() {
+	uint8_t hdr[4];
+	if (!read_exact_raw(hdr, 4)) {
+		eof_ = true;
+		block_buf_.clear();
+		block_pos_ = 0;
+		return false;
+	}
+
+	int32_t stream_block_len = static_cast<int32_t>(hdr[0]) | (static_cast<int32_t>(hdr[1]) << 8) |
+	                           (static_cast<int32_t>(hdr[2]) << 16) | (static_cast<int32_t>(hdr[3]) << 24);
+	if (stream_block_len < 4) {
+		throw std::runtime_error("Invalid stream block size in: " + path_);
+	}
+
+	std::vector<uint8_t> raw(static_cast<size_t>(stream_block_len));
+	if (!read_exact_raw(raw.data(), stream_block_len)) {
+		throw std::runtime_error("Truncated stream block in: " + path_);
+	}
+
+	int32_t decomp_size = static_cast<int32_t>(raw[0]) | (static_cast<int32_t>(raw[1]) << 8) |
+	                      (static_cast<int32_t>(raw[2]) << 16) | (static_cast<int32_t>(raw[3]) << 24);
+	if (decomp_size < 0) {
+		throw std::runtime_error("Invalid negative decomp_size in: " + path_);
+	}
+
+	block_buf_.resize(static_cast<size_t>(decomp_size));
+	int ret =
+	    duckdb_lz4::LZ4_decompress_safe(reinterpret_cast<const char *>(raw.data() + 4),
+	                                    reinterpret_cast<char *>(block_buf_.data()), stream_block_len - 4, decomp_size);
+	if (ret != decomp_size) {
+		throw std::runtime_error("LZ4 decompression failed in: " + path_);
+	}
+
+	block_pos_ = 0;
+	return true;
+}
+
+Lz4BlockDecoder::Lz4BlockDecoder(FileHandle &handle, const std::string &path) : handle_(handle), path_(path) {
+	fill_block();
+}
+
+uint8_t Lz4BlockDecoder::read_byte() {
+	if (eof_) {
+		throw std::runtime_error("Read past end of stream in: " + path_);
+	}
+	while (block_pos_ >= block_buf_.size()) {
+		if (!fill_block()) {
+			throw std::runtime_error("Read past end of stream in: " + path_);
+		}
+	}
+	uint8_t b = block_buf_[block_pos_++];
+	if (block_pos_ >= block_buf_.size() && !eof_) {
+		fill_block();
+	}
+	return b;
+}
+
+uint32_t Lz4BlockDecoder::read_leb128_u32() {
+	uint32_t result = 0;
+	int shift = 0;
+	uint8_t b;
+	int count = 0;
+	do {
+		if (count >= 5) {
+			throw std::runtime_error("LEB128 u32 overflow (>5 bytes) in: " + path_);
+		}
+		b = read_byte();
+		result |= (static_cast<uint32_t>(b & 0x7F) << shift);
+		shift += 7;
+		count++;
+	} while (b & 0x80);
+	return result;
+}
+
+uint64_t Lz4BlockDecoder::read_leb128_u64() {
+	uint64_t result = 0;
+	int shift = 0;
+	uint8_t b;
+	int count = 0;
+	do {
+		if (count >= 10) {
+			throw std::runtime_error("LEB128 u64 overflow (>10 bytes) in: " + path_);
+		}
+		b = read_byte();
+		result |= (static_cast<uint64_t>(b & 0x7F) << shift);
+		shift += 7;
+		count++;
+	} while (b & 0x80);
+	return result;
+}
+
+float Lz4BlockDecoder::read_float() {
+	uint8_t buf[4];
+	read_bytes(buf, 4);
+	float v;
+	std::memcpy(&v, buf, 4);
+	return v;
+}
+
+double Lz4BlockDecoder::read_double() {
+	uint8_t buf[8];
+	read_bytes(buf, 8);
+	double v;
+	std::memcpy(&v, buf, 8);
+	return v;
+}
+
+void Lz4BlockDecoder::read_bytes(void *buf, size_t n) {
+	size_t total = 0;
+	while (total < n) {
+		if (eof_) {
+			throw std::runtime_error("Read past end of stream in: " + path_);
+		}
+		while (block_pos_ >= block_buf_.size()) {
+			if (!fill_block()) {
+				throw std::runtime_error("Read past end of stream in: " + path_);
+			}
+		}
+		size_t avail = block_buf_.size() - block_pos_;
+		size_t to_copy = std::min(avail, n - total);
+		std::memcpy(static_cast<uint8_t *>(buf) + total, block_buf_.data() + block_pos_, to_copy);
+		block_pos_ += to_copy;
+		total += to_copy;
+		if (block_pos_ >= block_buf_.size() && !eof_) {
+			fill_block();
+		}
+	}
+}
+
+void Lz4BlockDecoder::skip_bytes(size_t n) {
+	while (n > 0) {
+		if (eof_) {
+			throw std::runtime_error("Skip past end of stream in: " + path_);
+		}
+		while (block_pos_ >= block_buf_.size()) {
+			if (!fill_block()) {
+				throw std::runtime_error("Skip past end of stream in: " + path_);
+			}
+		}
+		size_t avail = block_buf_.size() - block_pos_;
+		size_t to_skip = std::min(avail, n);
+		block_pos_ += to_skip;
+		n -= to_skip;
+		if (block_pos_ >= block_buf_.size() && !eof_) {
+			fill_block();
+		}
+	}
+}
+
+std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle, const std::string &path) {
+	if (codec_name == "ZstdBlockBufferSpec") {
+		return make_uniq<ZstdBlockDecoder>(handle, path);
+	}
+	if (codec_name == "LZ4HCBlockBufferSpec" || codec_name == "LZ4FastBlockBufferSpec") {
+		return make_uniq<Lz4BlockDecoder>(handle, path);
+	}
+	throw InvalidInputException("Unknown Hail codec: " + codec_name);
 }
 
 // ===========================================================================

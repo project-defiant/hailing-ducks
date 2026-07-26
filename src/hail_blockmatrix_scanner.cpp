@@ -7,7 +7,7 @@
 #include "duckdb/function/function.hpp"
 
 #include <nlohmann/json.hpp>
-#include <lz4.h>
+#include "lz4.hpp"
 
 #include <stdexcept>
 #include <string>
@@ -93,9 +93,9 @@ static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const st
 		size_t prev_size = result.size();
 		result.resize(prev_size + decompressed_len);
 
-		int ret =
-		    LZ4_decompress_safe(reinterpret_cast<const char *>(comp_buf.data()),
-		                        reinterpret_cast<char *>(result.data() + prev_size), compressed_len, decompressed_len);
+		int ret = duckdb_lz4::LZ4_decompress_safe(reinterpret_cast<const char *>(comp_buf.data()),
+		                                          reinterpret_cast<char *>(result.data() + prev_size), compressed_len,
+		                                          decompressed_len);
 		if (ret != decompressed_len) {
 			throw std::runtime_error("LZ4 decompression failed in: " + path_for_errors);
 		}

@@ -10,6 +10,20 @@
 
 namespace duckdb {
 
+class BlockDecoder {
+public:
+	virtual ~BlockDecoder() = default;
+
+	virtual bool eof() const = 0;
+	virtual uint8_t read_byte() = 0;
+	virtual uint32_t read_leb128_u32() = 0;
+	virtual uint64_t read_leb128_u64() = 0;
+	virtual float read_float() = 0;
+	virtual double read_double() = 0;
+	virtual void read_bytes(void *buf, size_t n) = 0;
+	virtual void skip_bytes(size_t n) = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ZstdBlockDecoder
 //
@@ -23,7 +37,7 @@ namespace duckdb {
 // transparently supported.  The fill_block() method loops over partial reads
 // (common for HTTP/cloud backends) just like DecompressHailLz4Stream does.
 // ---------------------------------------------------------------------------
-class ZstdBlockDecoder {
+class ZstdBlockDecoder : public BlockDecoder {
 public:
 	ZstdBlockDecoder(FileHandle &handle, const std::string &path);
 
@@ -31,17 +45,17 @@ public:
 	// Maintained eagerly: after each byte is read, if the current block is
 	// exhausted the next frame header is probed immediately, so eof() is
 	// accurate without needing an extra read call.
-	bool eof() const {
+	bool eof() const override {
 		return eof_;
 	}
 
-	uint8_t read_byte();
-	uint32_t read_leb128_u32(); // unsigned LEB128, 1–5 bytes
-	uint64_t read_leb128_u64(); // unsigned LEB128, 1–9 bytes
-	float read_float();         // 4 bytes raw IEEE 754
-	double read_double();       // 8 bytes raw IEEE 754
-	void read_bytes(void *buf, size_t n);
-	void skip_bytes(size_t n);
+	uint8_t read_byte() override;
+	uint32_t read_leb128_u32() override; // unsigned LEB128, 1–5 bytes
+	uint64_t read_leb128_u64() override; // unsigned LEB128, 1–10 bytes
+	float read_float() override;         // 4 bytes raw IEEE 754
+	double read_double() override;       // 8 bytes raw IEEE 754
+	void read_bytes(void *buf, size_t n) override;
+	void skip_bytes(size_t n) override;
 
 private:
 	FileHandle &handle_;
@@ -59,6 +73,35 @@ private:
 	// between frames.
 	bool fill_block();
 };
+
+class Lz4BlockDecoder : public BlockDecoder {
+public:
+	Lz4BlockDecoder(FileHandle &handle, const std::string &path);
+
+	bool eof() const override {
+		return eof_;
+	}
+
+	uint8_t read_byte() override;
+	uint32_t read_leb128_u32() override;
+	uint64_t read_leb128_u64() override;
+	float read_float() override;
+	double read_double() override;
+	void read_bytes(void *buf, size_t n) override;
+	void skip_bytes(size_t n) override;
+
+private:
+	FileHandle &handle_;
+	std::string path_;
+	std::vector<uint8_t> block_buf_;
+	size_t block_pos_ = 0;
+	bool eof_ = false;
+
+	bool read_exact_raw(void *buf, int64_t n);
+	bool fill_block();
+};
+
+std::unique_ptr<BlockDecoder> make_decoder(const std::string &codec_name, FileHandle &handle, const std::string &path);
 
 // ---------------------------------------------------------------------------
 // SQL table functions (testing helpers)

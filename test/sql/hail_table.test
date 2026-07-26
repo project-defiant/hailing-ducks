@@ -1,0 +1,126 @@
+# name: test/sql/hail_table.test
+# description: HailTable (.ht) scanner integration tests
+# group: [sql]
+
+require quack
+
+require-env HAILING_DUCKS_ROOT
+
+# --- Row count and flat scalar field ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- Nested STRUCT field (locus) ---
+
+query II
+SELECT locus.contig, locus.position
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+1	10000
+1	10050
+2	20000
+
+# --- Nested LIST field (alleles) ---
+
+query I
+SELECT alleles FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+[A, T]
+[G, C, A]
+[T, G]
+
+# --- Nested STRUCT field (pop_freq), sub-field access ---
+
+query IIII
+SELECT pop_freq.AC, pop_freq.AF, pop_freq.AN, pop_freq.homozygote_count
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture.ht') ORDER BY idx;
+----
+5	0.001	5000	0
+12	0.0024	5000	1
+0	0.0	4998	0
+
+# --- Optional LIST element: NULL elements occupy zero bytes on the wire ---
+
+query III
+SELECT tags[1], tags[2], tags[3]
+FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_optional_array.ht') ORDER BY idx;
+----
+A	NULL	B
+
+# --- Optional top-level field: row struct's own missing-bit prefix must be
+# read before decoding its fields (regression test for task-3 fix Important
+# #2 -- see hailtable_fixture_optional.ht, whose 'qual' field is optional at
+# the top level, unlike the main fixture where every field is required) ---
+
+query II
+SELECT idx, qual FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_optional.ht') ORDER BY idx;
+----
+0	1.500000
+1	NULL
+2	3.250000
+
+# --- Error: path does not contain rows/metadata.json.gz ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/no_such.ht');
+----
+Cannot open Hail table metadata
+
+# --- LZ4HC codec fallback: same row count and scalar values as Zstd ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4hc.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4hc.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- LZ4Fast codec fallback: same row count and scalar values as Zstd ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4fast.ht');
+----
+3
+
+query I
+SELECT idx FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_lz4fast.ht') ORDER BY idx;
+----
+0
+1
+2
+
+# --- Top-level metadata controls the row component relative path ---
+
+query I
+SELECT COUNT(*) FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_alt_rows.ht');
+----
+3
+
+# --- Unknown codec name in the nested _bufferSpec chain fails at bind time ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_bad_codec.ht');
+----
+Unknown Hail codec
+
+# --- Mismatched logical/encoded row types fail at bind time ---
+
+statement error
+SELECT * FROM hail_scan_table('${HAILING_DUCKS_ROOT}/test/hailtable_fixture_type_mismatch.ht');
+----
+Incompatible HailTable type metadata

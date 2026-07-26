@@ -11,7 +11,7 @@ in SQL, join it with other tables, and export it to any format DuckDB supports.
 | Hail type | File pattern | DuckDB function |
 |-----------|--------------|-----------------|
 | BlockMatrix | `<name>.bm/` | `hail_scan_blockmatrix(path)` |
-| HailTable *(Phase 2 — planned)* | `<name>.ht/` | `hail_scan_table(path)` |
+| HailTable | `<name>.ht/` | `hail_scan_table(path)` |
 
 ---
 
@@ -183,6 +183,35 @@ COPY (
 ) TO '/data/betas.parquet' (FORMAT PARQUET);
 ```
 
+### `hail_scan_table(path)`
+
+Scans a Hail `.ht` (HailTable) directory and returns one row per table row,
+with the DuckDB schema derived from the table's Hail type metadata.
+
+```sql
+-- Read every row
+SELECT * FROM hail_scan_table('/data/my_table.ht') LIMIT 10;
+```
+
+Nested Hail `Array` and `Struct` fields become DuckDB `LIST` and `STRUCT`
+columns. `Locus(GENOME)` decodes to `STRUCT(contig VARCHAR, position INTEGER)`.
+The scanner does not perform liftover; loci are returned exactly as encoded in
+the source table's reference genome.
+
+**Example queries**
+
+```sql
+-- Row count
+SELECT COUNT(*) FROM hail_scan_table('test/hailtable_fixture.ht');
+
+-- Nested struct field access
+SELECT locus.contig, locus.position
+FROM hail_scan_table('test/hailtable_fixture.ht');
+
+-- List field
+SELECT alleles FROM hail_scan_table('test/hailtable_fixture.ht');
+```
+
 ---
 
 ## Running the tests
@@ -210,11 +239,16 @@ hailing-ducks/
 │   │   ├── hail_blockmatrix_scanner.hpp   # BlockMatrix function declaration
 │   │   └── quack_extension.hpp            # Extension entry point declaration
 │   ├── hail_blockmatrix_scanner.cpp       # BlockMatrix scanner implementation
+│   ├── hail_table_scanner.cpp             # HailTable scanner implementation
+│   ├── hail_type_parser.cpp               # Hail VType/EType parser
 │   └── quack_extension.cpp                # DuckDB extension registration
 ├── test/
 │   ├── sql/
 │   │   ├── hail_blockmatrix.test          # BlockMatrix SQL tests
+│   │   ├── hail_table.test                # HailTable SQL tests
+│   │   ├── hail_type_parser.test          # Type parser SQL tests
 │   │   └── quack.test                     # Baseline extension tests
+│   ├── hailtable_fixture.ht/              # Synthetic HailTable fixture
 │   └── matrix.bm/                         # 1000×1000 test fixture (blockSize=4096)
 ├── CMakeLists.txt                          # Build configuration
 ├── vcpkg.json                              # vcpkg dependency manifest
@@ -236,11 +270,14 @@ A `.bm` directory contains:
 ## Roadmap
 
 - [x] Phase 1 — BlockMatrix scanner (`hail_scan_blockmatrix`)
-- [ ] Phase 2 — HailTable scanner (`hail_scan_table`)
-  - Dynamic schema from `metadata.json.gz`
-  - BufferSpec-aware decompression (Zstd, LZ4HC, uncompressed)
-  - LEB128 / zigzag integer decoding
-  - EStruct missingness bitmask handling
+- [x] Phase 2 — HailTable scanner (`hail_scan_table`)
+  - [x] Dynamic schema from `metadata.json.gz`
+  - [x] BufferSpec-aware decompression (Zstd, LZ4HC, LZ4Fast)
+  - [x] Unsigned LEB128 integer decoding
+  - [x] Nested `LIST`/`STRUCT` output with missingness bitmask handling
+
+Known gaps: uncompressed HailTable codecs, globals, and key-index lookups are
+not implemented. The scanner currently targets full sequential row scans.
 
 ---
 
