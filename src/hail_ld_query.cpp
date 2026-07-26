@@ -14,15 +14,16 @@
 namespace duckdb {
 
 // Simple status codes table function: hail_ld_status_codes()
-static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
-    fprintf(stderr, "[hail_ld] HailLDStatusCodes called\n");
-    // schema: status_domain, status_code, status_name, description
-    const idx_t capacity = STANDARD_VECTOR_SIZE;
-    idx_t out_row = 0;
+struct StatusLocalState : public LocalTableFunctionState {
+    struct Row { std::string domain; int32_t code; std::string name; std::string desc; };
+    std::vector<Row> rows;
+    idx_t next = 0;
+};
 
+static unique_ptr<LocalTableFunctionState> HailLDStatusInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+    auto state = make_uniq<StatusLocalState>();
     // Prepare static list
-    struct Status { const char *domain; int code; const char *name; const char *desc; };
-    Status statuses[] = {
+    state->rows = {
         {"variant", 0, "resolved_exact", "Variant resolved by exact match in HT"},
         {"variant", 1, "resolved_flipped", "Variant resolved by flipped alleles in HT"},
         {"variant", 2, "not_found_in_ht", "Variant not found in HT"},
@@ -36,22 +37,32 @@ static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, 
         {"bm", 3, "bm_missing_block", "BM block file missing"},
         {"bm", 4, "bm_missing_or_nan", "BM value missing or NaN"}
     };
+    return std::move(state);
+}
 
-    idx_t n = sizeof(statuses) / sizeof(statuses[0]);
-    // Fill output vectors
+static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+    auto &local = data.local_state->Cast<StatusLocalState>();
+    if (local.next >= local.rows.size()) {
+        output.SetCardinality(0);
+        return;
+    }
+    const idx_t capacity = STANDARD_VECTOR_SIZE;
+    idx_t to_emit = std::min<idx_t>(capacity, (idx_t)(local.rows.size() - local.next));
+
     auto &domain_vec = output.data[0];
     auto &code_vec = output.data[1];
     auto &name_vec = output.data[2];
     auto &desc_vec = output.data[3];
 
-    for (idx_t i = 0; i < n && i < capacity; ++i) {
-        StringVector::AddString(domain_vec, statuses[i].domain);
-        FlatVector::GetData<int32_t>(code_vec)[i] = statuses[i].code;
-        StringVector::AddString(name_vec, statuses[i].name);
-        StringVector::AddString(desc_vec, statuses[i].desc);
-        out_row++;
+    for (idx_t i = 0; i < to_emit; ++i) {
+        auto &r = local.rows[local.next + i];
+        StringVector::AddString(domain_vec, r.domain);
+        FlatVector::GetData<int32_t>(code_vec)[i] = r.code;
+        StringVector::AddString(name_vec, r.name);
+        StringVector::AddString(desc_vec, r.desc);
     }
-    output.SetCardinality(out_row);
+    local.next += to_emit;
+    output.SetCardinality(to_emit);
 }
 
 // Hail LD request preflight: validate request rows and emit variant status events
@@ -157,7 +168,8 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
             names = {"status_domain", "status_code", "status_name", "description"};
             return_types = {LogicalType::VARCHAR, LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::VARCHAR};
             return nullptr;
-        }
+        },
+        nullptr, HailLDStatusInitLocal
     );
     loader.RegisterFunction(status_func);
 
