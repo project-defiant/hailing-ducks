@@ -147,9 +147,9 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
 
     for (idx_t i = 0; i < to_emit; ++i) {
         auto &r = local.rows[local.next + i];
-        StringVector::AddString(locus_vec, r.locus_id);
-        StringVector::AddString(req_vec, r.req);
-        StringVector::AddString(dom_vec, "variant");
+        FlatVector::GetData<string_t>(locus_vec)[i] = StringVector::AddString(locus_vec, r.locus_id.c_str());
+        FlatVector::GetData<string_t>(req_vec)[i] = StringVector::AddString(req_vec, r.req.c_str());
+        FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "variant");
         FlatVector::GetData<int32_t>(code_vec)[i] = r.code;
     }
     local.next += to_emit;
