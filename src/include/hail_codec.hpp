@@ -51,7 +51,7 @@ public:
 
 	uint8_t read_byte() override;
 	uint32_t read_leb128_u32() override; // unsigned LEB128, 1–5 bytes
-	uint64_t read_leb128_u64() override; // unsigned LEB128, 1–9 bytes
+	uint64_t read_leb128_u64() override; // unsigned LEB128, 1–10 bytes
 	float read_float() override;         // 4 bytes raw IEEE 754
 	double read_double() override;       // 8 bytes raw IEEE 754
 	void read_bytes(void *buf, size_t n) override;

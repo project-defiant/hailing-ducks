@@ -9,15 +9,16 @@ namespace duckdb {
 
 // ---------------------------------------------------------------------------
 // EType: Hail's *encoded* type description — drives wire-format decoding.
-// A '+' prefix on a struct field or array element means "required"
-// (non-optional); required fields/elements have no missing-bit slot.
+// A '+' prefix means "required" (non-optional). It is meaningful on the
+// top-level EType and on nested struct fields/array elements; required
+// fields/elements have no missing-bit slot in their containing value.
 // ---------------------------------------------------------------------------
 
 enum class EKind { Int32, Int64, Float32, Float64, Boolean, Binary, Array, BaseStruct };
 
 struct ETypeNode {
 	EKind kind;
-	bool required = false;           // meaningful only as a struct field / array element
+	bool required = false;           // top-level marker or nested field/element requiredness
 	std::string name;                // meaningful only as a struct field
 	std::vector<ETypeNode> children; // Array: exactly 1 (the element type)
 	                                 // BaseStruct: N, in field order

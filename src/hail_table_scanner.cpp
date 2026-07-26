@@ -159,91 +159,6 @@ static void ValidateTypeCompatibility(const VTypeNode &vtype, const ETypeNode &e
 }
 
 // ---------------------------------------------------------------------------
-// SkipValue: consumes exactly the bytes a value of the given EType occupies,
-// without writing anything out. Needed so that fields not yet fully decoded
-// (nested Array/BaseStruct, until Task 5 lands) don't desync the byte cursor
-// for whatever comes after them in the row.
-// ---------------------------------------------------------------------------
-
-static void SkipValue(const ETypeNode &etype, BlockDecoder &decoder) {
-	switch (etype.kind) {
-	case EKind::Int32:
-		decoder.read_leb128_u32();
-		return;
-	case EKind::Int64:
-		decoder.read_leb128_u64();
-		return;
-	case EKind::Float32:
-		decoder.read_float();
-		return;
-	case EKind::Float64:
-		decoder.read_double();
-		return;
-	case EKind::Boolean:
-		decoder.read_byte();
-		return;
-	case EKind::Binary: {
-		uint32_t len = decoder.read_leb128_u32();
-		decoder.skip_bytes(len);
-		return;
-	}
-	case EKind::Array: {
-		uint32_t len = decoder.read_leb128_u32();
-		const ETypeNode &elem = etype.children[0];
-		if (!elem.required) {
-			// Same missing-bit protocol as BaseStruct below, but per-element: a
-			// NULL element occupies zero bytes on the wire, so the bits must be
-			// read and consulted -- calling SkipValue unconditionally for every
-			// element (including NULL ones) would over-read into the next
-			// element/field/row.
-			size_t n_missing_bytes = (static_cast<size_t>(len) + 7) / 8;
-			std::vector<uint8_t> missing_bits(n_missing_bytes);
-			if (n_missing_bytes > 0) {
-				decoder.read_bytes(missing_bits.data(), n_missing_bytes);
-			}
-			for (uint32_t i = 0; i < len; i++) {
-				bool is_null = (missing_bits[i / 8] >> (i % 8)) & 1;
-				if (!is_null) {
-					SkipValue(elem, decoder);
-				}
-			}
-		} else {
-			for (uint32_t i = 0; i < len; i++) {
-				SkipValue(elem, decoder);
-			}
-		}
-		return;
-	}
-	case EKind::BaseStruct: {
-		int n_optional = 0;
-		for (auto &f : etype.children) {
-			if (!f.required) {
-				n_optional++;
-			}
-		}
-		size_t n_missing_bytes = (static_cast<size_t>(n_optional) + 7) / 8;
-		std::vector<uint8_t> missing_bits(n_missing_bytes);
-		if (n_missing_bytes > 0) {
-			decoder.read_bytes(missing_bits.data(), n_missing_bytes);
-		}
-		int optional_idx = 0;
-		for (auto &f : etype.children) {
-			bool is_null = false;
-			if (!f.required) {
-				is_null = (missing_bits[optional_idx / 8] >> (optional_idx % 8)) & 1;
-				optional_idx++;
-			}
-			if (!is_null) {
-				SkipValue(f, decoder);
-			}
-		}
-		return;
-	}
-	}
-	throw std::runtime_error("Unhandled EKind in SkipValue");
-}
-
-// ---------------------------------------------------------------------------
 // DecodeValue: recursively writes the value of an EType into a DuckDB Vector
 // at the given row. Optional/null handling is owned by the caller for the
 // current value; nested arrays/structs read their own missing-bit prefixes.
@@ -468,9 +383,9 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 	// The row struct (bind_data.etype) is structurally just a BaseStruct like any
 	// nested one -- if it has optional top-level fields, Hail's wire format
 	// requires a ceil(n_optional/8)-byte missing-bit prefix to be read and
-	// consulted before decoding the fields, exactly as SkipValue's BaseStruct
-	// case already does for nested structs. Compute this once (bind_data.etype
-	// doesn't change across rows) and reuse the scratch buffer per row.
+	// consulted before decoding the fields, just like DecodeValue does for
+	// nested structs. Compute this once (bind_data.etype doesn't change across
+	// rows) and reuse the scratch buffer per row.
 	int n_optional_fields = 0;
 	for (auto &f : bind_data.etype.children) {
 		if (!f.required) {
@@ -500,7 +415,7 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 			// "a row follows," 0x00 means "end of partition." This is a real Hail
 			// wire-protocol detail (verified by manually decoding a real Pan-UKBB
 			// partition) that is NOT part of the row struct's own missing-bit
-			// encoding -- do not fold it into DecodeValue/SkipValue.
+			// encoding -- keep it in the top-level row scan loop.
 			uint8_t continue_flag = local_state.decoder->read_byte();
 			if (continue_flag == 0) {
 				local_state.partition_done = true;

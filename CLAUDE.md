@@ -11,9 +11,8 @@ any format DuckDB supports. Built on the standard [duckdb/extension-template](ht
 
 Supported formats:
 - **BlockMatrix** (`<name>.bm/`) — `hail_scan_blockmatrix(path)`, implemented (Phase 1).
-- **HailTable** (`<name>.ht/`) — `hail_scan_table(path)`, planned (Phase 2). The codec building
-  blocks for this (`ZstdBlockDecoder`, LEB128 reading) already exist in `src/hail_codec.cpp` but no
-  table-scanning function consumes them yet.
+- **HailTable** (`<name>.ht/`) — `hail_scan_table(path)`, implemented (Phase 2) with metadata-driven
+  schemas, nested `LIST`/`STRUCT` output, and Zstd/LZ4HC/LZ4Fast row decoding.
 
 ## Build commands
 
@@ -36,9 +35,10 @@ Build artifacts:
 | `build/release/test/unittest` | Test runner with the extension linked in |
 | `build/release/extension/quack/quack.duckdb_extension` | Standalone loadable binary |
 
-Non-vcpkg dependencies (lz4, nlohmann-json, OpenSSL) are resolved via `find_package`/Homebrew paths
-in `CMakeLists.txt`, falling back to vcpkg or a downloaded single-header (nlohmann/json) if not found
-locally. See `README.md` for per-OS install commands (`brew install …` / `apt install …`).
+Non-vcpkg dependencies (nlohmann-json, OpenSSL) are resolved via `find_package`/Homebrew paths in
+`CMakeLists.txt`, falling back to vcpkg or a downloaded single-header for `nlohmann/json` if not
+found locally. LZ4 is built from DuckDB's bundled `duckdb/third_party/lz4` source, not from vcpkg or
+a system `find_package(lz4)`.
 
 ## Test commands
 
@@ -102,24 +102,20 @@ Reads a `.bm` directory: `metadata.json` (`blockSize`, `nRows`, `nCols`, `partFi
 value DOUBLE)`, one row per matrix element. Partition filenames from `metadata.json` are validated
 against path traversal (`..`, `/`, `\`) before being joined onto the base path.
 
-### `hail_codec.cpp` / `hail_codec.hpp` — Hail codec stack (for HailTable, Phase 2)
+### `hail_codec.cpp` / `hail_codec.hpp` — Hail codec stack
 
-`ZstdBlockDecoder` decodes the layered Hail codec stack used by HailTable part files, innermost to
-outermost as read: `StreamBlockBufferSpec` (outer frame: `[int32 stream_block_len][bytes]`) wrapping
-`ZstdBlockBufferSpec` (`[int32 decomp_size][zstd payload]`, decompressed via DuckDB's bundled
-`duckdb_zstd`) wrapping a `BlockingBufferSpec` 64KB logical window, itself wrapping
-`LEB128BufferSpec` (ints/longs are **unsigned** LEB128 per Hail convention — not zigzag — while
-floats/doubles are raw IEEE 754). It exposes `read_byte`, `read_leb128_u32`/`read_leb128_u64`
+`BlockDecoder` is the shared scanner-facing interface for HailTable part files. The factory walks
+the metadata `BufferSpec` chain and dispatches to Zstd or LZ4; both `LZ4HCBlockBufferSpec` and
+`LZ4FastBlockBufferSpec` use DuckDB's bundled LZ4 implementation. The decoded stream exposes
+`read_byte`, `read_leb128_u32`/`read_leb128_u64`
 (overflow-guarded at 5/10 bytes), `read_float`/`read_double`, and `read_bytes`/`skip_bytes` (bulk,
 cross-block-boundary aware). `eof()` is maintained eagerly — the next frame header is probed as soon
 as the current block is exhausted, so it's accurate without an extra read call.
 
 The three registered functions here (`hail_zstd_info`, `hail_leb128_u32`, `hail_leb128_u64`) exist
 purely as **testing helpers** for `ZstdBlockDecoder` itself — they are not part of the public HailTable
-scanning API, which does not exist yet. When implementing Phase 2 (`hail_scan_table`), build on
-`ZstdBlockDecoder` rather than re-deriving the frame/LEB128 logic; still-needed pieces per the
-roadmap in `README.md` are dynamic schema from `metadata.json.gz`, BufferSpec-aware decompression for
-non-Zstd variants (LZ4HC, uncompressed), and EStruct missingness-bitmask handling.
+scanning API. `hail_scan_table` consumes the shared decoder abstraction directly instead of
+re-deriving frame, LEB128, or LZ4/Zstd logic.
 
 ## Updating the DuckDB target version
 

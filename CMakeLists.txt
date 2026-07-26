@@ -47,11 +47,8 @@ set(EXTENSION_SOURCES
     src/hail_codec.cpp
     src/hail_type_parser.cpp
     src/hail_table_scanner.cpp
+    duckdb/third_party/lz4/lz4.cpp
 )
-
-if(NOT CLANG_TIDY)
-    set(EXTENSION_SOURCES ${EXTENSION_SOURCES} duckdb/third_party/lz4/lz4.cpp)
-endif()
 
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
