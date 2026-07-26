@@ -56,10 +56,10 @@ static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, 
 
     for (idx_t i = 0; i < to_emit; ++i) {
         auto &r = local.rows[local.next + i];
-        StringVector::AddString(domain_vec, r.domain);
+        FlatVector::GetData<string_t>(domain_vec)[i] = StringVector::AddString(domain_vec, r.domain.c_str());
         FlatVector::GetData<int32_t>(code_vec)[i] = r.code;
-        StringVector::AddString(name_vec, r.name);
-        StringVector::AddString(desc_vec, r.desc);
+        FlatVector::GetData<string_t>(name_vec)[i] = StringVector::AddString(name_vec, r.name.c_str());
+        FlatVector::GetData<string_t>(desc_vec)[i] = StringVector::AddString(desc_vec, r.desc.c_str());
     }
     local.next += to_emit;
     output.SetCardinality(to_emit);
