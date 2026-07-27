@@ -366,12 +366,17 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
                                                                         GlobalTableFunctionState *) {
     auto state = make_uniq<DebugLocalState>();
     std::string s;
+    FILE *f = fopen("test/hail_ld_initlocal_debug.log", "a");
     if (input.bind_data) {
         auto &bind = input.bind_data->Cast<PreflightBindData>();
         s = bind.request_arg;
+        if (f) fprintf(f, "INITLOCAL_DEBUG: bind_data present, request_arg='%s'\n", s.c_str());
     } else if (!input.inputs.empty()) {
-        s = input.inputs[0].GetValue<string>();
+        try { s = input.inputs[0].GetValue<string>(); if (f) fprintf(f, "INITLOCAL_DEBUG: input[0] provided '%s'\n", s.c_str()); } catch (...) { if (f) fprintf(f, "INITLOCAL_DEBUG: input[0] get failed\n"); }
+    } else {
+        if (f) fprintf(f, "INITLOCAL_DEBUG: no bind_data and no input args\n");
     }
+    if (f) fclose(f);
     if (s.empty()) return std::move(state);
     auto parts = StringUtil::Split(s, "|");
     if (parts.size() != 3) return std::move(state);
@@ -501,11 +506,21 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
             names = {"original_token", "stripped_token", "contig", "pos", "ref", "alt", "parse_ok"};
             return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
             auto bind_data = make_uniq<PreflightBindData>();
+            // debug logging
+            FILE *f = fopen("test/hail_ld_bind_debug.log", "a");
+            if (f) {
+                fprintf(f, "DEBUG_BIND called: inputs_empty=%d, input_count=%zu\n", input.inputs.empty() ? 1 : 0, input.inputs.size());
+                if (!input.inputs.empty()) {
+                    try { auto v = input.inputs[0].GetValue<string>(); fprintf(f, "DEBUG_BIND input[0]='%s'\n", v.c_str()); } catch (...) { fprintf(f, "DEBUG_BIND input[0] get failed\n"); }
+                }
+                fclose(f);
+            }
             if (!input.inputs.empty()) {
                 bind_data->request_arg = input.inputs[0].GetValue<string>();
             }
             return std::move(bind_data);
         },
+
         nullptr, HailLDPreflightInitLocalDebug);
     loader.RegisterFunction(debug_func);
     fprintf(stderr, "[hail_ld] registered hail_ld_preflight_debug\n");
