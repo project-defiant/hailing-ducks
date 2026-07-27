@@ -6,9 +6,11 @@
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/file_system.hpp"
+#include "duckdb/main/relation.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdio>
@@ -619,18 +621,13 @@ struct HTMatch {
 	int32_t allele_order;
 };
 
-static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, TableFunctionBindInput &input,
-                                                    vector<LogicalType> &return_types, vector<string> &names) {
-	names = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
-	         "allele_order", "status_domain",        "status_code"};
-	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
-	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER};
-	auto bind_data = make_uniq<HTResolveBindData>();
-	if (input.inputs.size() < 2) {
-		return std::move(bind_data);
-	}
-	std::string ht_path = input.inputs[0].GetValue<string>();
-	std::string requests_path = input.inputs[1].GetValue<string>();
+// Core HT resolution logic, independent of any particular table function's argument shape: reused
+// by hail_ld_resolve_ht directly and by hail_ld_materialize (issue #21), which needs this exact same
+// single-pass result in memory rather than re-invoking hail_ld_resolve_ht via SQL (table function
+// arguments can't contain subqueries, and re-running it would violate "one physical extraction").
+static std::vector<HTResolveOutRow> ResolveHTCore(ClientContext &context, const std::string &ht_path,
+                                                  const std::string &requests_path) {
+	std::vector<HTResolveOutRow> rows;
 
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto metadata = LoadHailTableMetadata(fs, ht_path);
@@ -683,7 +680,7 @@ static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, Tabl
 			out.locus_id = r.locus_id;
 			out.requested_variant_id = r.req;
 			out.status_code = r.code;
-			bind_data->rows.push_back(std::move(out));
+			rows.push_back(std::move(out));
 		}
 		if (candidates.empty()) {
 			continue;
@@ -773,10 +770,26 @@ static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, Tabl
 				out.allele_order = m[0].allele_order;
 				out.status_code = m[0].allele_order == 1 ? 0 : 1; // resolved_exact / resolved_flipped
 			}
-			bind_data->rows.push_back(std::move(out));
+			rows.push_back(std::move(out));
 		}
 	}
 
+	return rows;
+}
+
+static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
+	         "allele_order", "status_domain",        "status_code"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER};
+	auto bind_data = make_uniq<HTResolveBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string requests_path = input.inputs[1].GetValue<string>();
+	bind_data->rows = ResolveHTCore(context, ht_path, requests_path);
 	return std::move(bind_data);
 }
 
@@ -1390,6 +1403,157 @@ static void HailLDBMPairsBatchStatsScan(ClientContext &context, TableFunctionInp
 	output.SetCardinality(1);
 }
 
+// ---------------------------------------------------------------------------
+// hail_ld_materialize(ht_path, bm_path, requests_path, ld_output_path, status_output_path,
+// max_cached_blocks := 64): the materializer/CLI surface (issue #21). Performs exactly one HT
+// extraction (ResolveHTCore) and exactly one BM extraction (ProcessBMPairsBatch) and writes both
+// user-facing Parquet outputs from that single in-memory pass, so nf-fine-mapping users never see
+// the internal event-stream shape. Doesn't manage S3/httpfs credentials itself -- paths are passed
+// straight through to DuckDB's own FileSystem/httpfs layer exactly like every other path-taking
+// function in this file, so there's no additional surface here that could leak a secret.
+// ---------------------------------------------------------------------------
+
+// Only resolved_exact(0)/resolved_flipped(1) variants participate in BM pairs; everything else
+// (outside_locus/unsupported/multiple_variants_at_position/not_found_in_ht/ambiguous_in_ht) has no
+// HT index to pair with, so it's naturally excluded here without needing its own special case.
+static std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>>
+GroupResolvedForBMBatch(const std::vector<HTResolveOutRow> &ht_rows) {
+	std::map<std::string, std::vector<BMBatchResolvedVariant>> grouped_map;
+	for (auto &r : ht_rows) {
+		if (r.status_code != 0 && r.status_code != 1) {
+			continue;
+		}
+		grouped_map[r.locus_id].push_back({r.idx, r.allele_order});
+	}
+	return std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>>(grouped_map.begin(),
+	                                                                                grouped_map.end());
+}
+
+// Writes `rows` to a Parquet file at `path` with the given column names/types, using DuckDB's own
+// Relation/Value APIs (no hand-built SQL string, so no string-escaping/injection concerns for
+// locus_id/variant-id values). A relation can't be built from zero rows without explicit types, so
+// the empty case goes through a tiny always-empty typed SELECT instead.
+static void WriteRowsToParquet(ClientContext &context, const std::string &path, const vector<string> &column_names,
+                               const vector<LogicalType> &column_types, const vector<vector<Value>> &rows) {
+	Connection con(*context.db);
+	shared_ptr<Relation> relation;
+	if (rows.empty()) {
+		std::string select_list;
+		for (idx_t i = 0; i < column_names.size(); ++i) {
+			if (i > 0) {
+				select_list += ", ";
+			}
+			select_list += "CAST(NULL AS " + column_types[i].ToString() + ") AS " +
+			               KeywordHelper::WriteOptionallyQuoted(column_names[i]);
+		}
+		relation = con.RelationFromQuery("SELECT " + select_list + " WHERE FALSE");
+	} else {
+		relation = con.Values(rows, column_names);
+	}
+	relation->WriteParquet(path);
+}
+
+struct HailLDMaterializeBindData : public TableFunctionData {
+	int64_t ld_pairs_written = 0;
+	int64_t status_rows_written = 0;
+};
+
+static unique_ptr<FunctionData> HailLDMaterializeBind(ClientContext &context, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"ld_pairs_written", "status_rows_written"};
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto bind_data = make_uniq<HailLDMaterializeBindData>();
+	if (input.inputs.size() < 5) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string bm_path = input.inputs[1].GetValue<string>();
+	std::string requests_path = input.inputs[2].GetValue<string>();
+	std::string ld_output_path = input.inputs[3].GetValue<string>();
+	std::string status_output_path = input.inputs[4].GetValue<string>();
+
+	int32_t max_cached_blocks = 64;
+	auto named_it = input.named_parameters.find("max_cached_blocks");
+	if (named_it != input.named_parameters.end()) {
+		max_cached_blocks = named_it->second.GetValue<int32_t>();
+	}
+
+	// One physical HT extraction ...
+	auto ht_rows = ResolveHTCore(context, ht_path, requests_path);
+
+	// ... and one physical BM extraction, both feeding both outputs below.
+	auto grouped = GroupResolvedForBMBatch(ht_rows);
+	auto bm_result = ProcessBMPairsBatch(context, bm_path, grouped, max_cached_blocks);
+
+	{
+		vector<string> cols = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
+		                       "allele_order", "status_domain",        "status_code"};
+		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                             LogicalType::BIGINT,  LogicalType::INTEGER, LogicalType::VARCHAR,
+		                             LogicalType::INTEGER};
+		vector<vector<Value>> status_rows;
+		for (auto &r : ht_rows) {
+			status_rows.push_back({
+			    Value(r.locus_id),
+			    Value(r.requested_variant_id),
+			    r.has_matched_variant_id ? Value(r.matched_variant_id) : Value(LogicalType::VARCHAR),
+			    r.has_idx ? Value::BIGINT(r.idx) : Value(LogicalType::BIGINT),
+			    r.has_allele_order ? Value::INTEGER(r.allele_order) : Value(LogicalType::INTEGER),
+			    Value(std::string("variant")),
+			    Value::INTEGER(r.status_code),
+			});
+		}
+		WriteRowsToParquet(context, status_output_path, cols, types, status_rows);
+		bind_data->status_rows_written = static_cast<int64_t>(status_rows.size());
+	}
+
+	{
+		vector<string> cols = {"locus_id", "idx_i", "idx_j", "r"};
+		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+		                             LogicalType::DOUBLE};
+		vector<vector<Value>> ld_rows;
+		// ld_pairs.parquet contains only successful pairs -- BM failures (missing block, NaN, out of
+		// bounds) are diagnostic, not LD output, and must not pollute downstream matrix construction.
+		for (auto &r : bm_result.rows) {
+			if (!r.has_r) {
+				continue;
+			}
+			ld_rows.push_back({Value(r.locus_id), Value::BIGINT(r.idx_i), Value::BIGINT(r.idx_j), Value::DOUBLE(r.r)});
+		}
+		WriteRowsToParquet(context, ld_output_path, cols, types, ld_rows);
+		bind_data->ld_pairs_written = static_cast<int64_t>(ld_rows.size());
+	}
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDMaterializeInitGlobal(ClientContext &context,
+                                                                        TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct HailLDMaterializeLocalState : public LocalTableFunctionState {
+	bool emitted = false;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDMaterializeInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	return make_uniq<HailLDMaterializeLocalState>();
+}
+
+static void HailLDMaterializeScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<HailLDMaterializeBindData>();
+	auto &local = data.local_state->Cast<HailLDMaterializeLocalState>();
+	if (local.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	FlatVector::GetData<int64_t>(output.data[0])[0] = bind_data.ld_pairs_written;
+	FlatVector::GetData<int64_t>(output.data[1])[0] = bind_data.status_rows_written;
+	local.emitted = true;
+	output.SetCardinality(1);
+}
+
 // Debug table function: emit parsed parts for each token for inspection
 struct DebugLocalState : public LocalTableFunctionState {
 	struct Row {
@@ -1597,6 +1761,14 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 	    HailLDBMPairsBatchStatsBind, HailLDPreflightInitGlobal, HailLDBMPairsBatchStatsInitLocal);
 	bm_pairs_batch_stats_func.named_parameters["max_cached_blocks"] = LogicalType::INTEGER;
 	loader.RegisterFunction(bm_pairs_batch_stats_func);
+
+	// Materializer: one physical HT+BM extraction, writes ld_pairs.parquet + variant_resolution_status.parquet
+	TableFunction materialize_func(
+	    "hail_ld_materialize",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    HailLDMaterializeScan, HailLDMaterializeBind, HailLDMaterializeInitGlobal, HailLDMaterializeInitLocal);
+	materialize_func.named_parameters["max_cached_blocks"] = LogicalType::INTEGER;
+	loader.RegisterFunction(materialize_func);
 
 	// debug preflight parser inspection function
 	TableFunction debug_func(
