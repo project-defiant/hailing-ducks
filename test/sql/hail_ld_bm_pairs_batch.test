@@ -1,0 +1,82 @@
+# name: test/sql/hail_ld_bm_pairs_batch.test
+# group: [sql]
+
+require quack
+
+# hail_ld_bm_pairs_batch(bm_path, resolved, max_cached_blocks := 64): the multi-locus version of
+# hail_ld_bm_pairs (#19) -- `resolved` now carries a locus_id per row, pairs are generated only
+# within each locus (never across loci), but all loci in one call share ONE query-local decompressed
+# block cache, so overlapping loci reuse blocks instead of re-fetching them.
+#
+# Fixture test/matrix_ld.bm (see hail_ld_bm_pairs.test): blockSize=2. Loci A and B both request the
+# pair (0,1), which lives entirely in block 0 -- proving block reuse across loci, while their
+# different allele_order combinations prove per-locus sign correction stays isolated even though the
+# block is shared. Locus C requests pair (2,3), which lives in block 4 (a different block).
+query TIIRTI
+SELECT locus_id, idx_i, idx_j, r, bm_status_domain, bm_status_code
+FROM hail_ld_bm_pairs_batch('test/matrix_ld.bm', [
+  {'locus_id': 'A', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'A', 'idx': 1::BIGINT, 'allele_order': -1},
+  {'locus_id': 'B', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'B', 'idx': 1::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 2::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 3::BIGINT, 'allele_order': 1}
+])
+ORDER BY locus_id, idx_i, idx_j;
+----
+A	0	1	-0.5	bm	0
+B	0	1	0.5	bm	0
+C	2	3	2.0	bm	0
+
+# hail_ld_bm_pairs_batch_stats reports the same shared-cache behavior as observable counters (proving
+# "reuse across overlapping loci" and "deterministic eviction" through SQL output, not internal
+# state): with the default cache size, block 0 (needed by both A and B) is opened once and hit once;
+# block 4 (needed by C) is opened once; nothing is evicted.
+query III
+SELECT blocks_opened, cache_hits, evictions
+FROM hail_ld_bm_pairs_batch_stats('test/matrix_ld.bm', [
+  {'locus_id': 'A', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'A', 'idx': 1::BIGINT, 'allele_order': -1},
+  {'locus_id': 'B', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'B', 'idx': 1::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 2::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 3::BIGINT, 'allele_order': 1}
+]);
+----
+2	1	0
+
+# With max_cached_blocks := 1, block 0 (loaded for A, reused for B) gets evicted to make room for
+# block 4 (needed by C) -- a deterministic capacity-1 LRU eviction, provable via the same counters.
+query III
+SELECT blocks_opened, cache_hits, evictions
+FROM hail_ld_bm_pairs_batch_stats('test/matrix_ld.bm', [
+  {'locus_id': 'A', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'A', 'idx': 1::BIGINT, 'allele_order': -1},
+  {'locus_id': 'B', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'B', 'idx': 1::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 2::BIGINT, 'allele_order': 1},
+  {'locus_id': 'C', 'idx': 3::BIGINT, 'allele_order': 1}
+], max_cached_blocks := 1);
+----
+2	1	1
+
+# Per-locus status isolation: a not-found/out-of-bounds/missing-block status in one locus must not
+# leak into another locus's rows sharing the same call.
+query TIIRTI
+SELECT locus_id, idx_i, idx_j, r, bm_status_domain, bm_status_code
+FROM hail_ld_bm_pairs_batch('test/matrix_ld.bm', [
+  {'locus_id': 'D', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'D', 'idx': 4::BIGINT, 'allele_order': 1},
+  {'locus_id': 'E', 'idx': 0::BIGINT, 'allele_order': 1},
+  {'locus_id': 'E', 'idx': 1::BIGINT, 'allele_order': 1}
+])
+ORDER BY locus_id, idx_i, idx_j;
+----
+D	0	4	NULL	bm	3
+E	0	1	0.5	bm	0
+
+# Empty resolved list -> zero rows.
+query I
+SELECT COUNT(*) FROM hail_ld_bm_pairs_batch('test/matrix_ld.bm', CAST([] AS STRUCT(locus_id VARCHAR, idx BIGINT, allele_order INTEGER)[]));
+----
+0
