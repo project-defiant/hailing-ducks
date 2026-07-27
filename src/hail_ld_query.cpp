@@ -371,10 +371,8 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
         auto &bind = input.bind_data->Cast<PreflightBindData>();
         s = bind.request_arg;
         if (f) fprintf(f, "INITLOCAL_DEBUG: bind_data present, request_arg='%s'\n", s.c_str());
-    } else if (!input.inputs.empty()) {
-        try { s = input.inputs[0].GetValue<string>(); if (f) fprintf(f, "INITLOCAL_DEBUG: input[0] provided '%s'\n", s.c_str()); } catch (...) { if (f) fprintf(f, "INITLOCAL_DEBUG: input[0] get failed\n"); }
     } else {
-        if (f) fprintf(f, "INITLOCAL_DEBUG: no bind_data and no input args\n");
+        if (f) fprintf(f, "INITLOCAL_DEBUG: no bind_data available\n");
     }
     if (f) fclose(f);
     if (s.empty()) return std::move(state);
