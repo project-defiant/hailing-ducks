@@ -1,0 +1,12 @@
+require quack
+
+# Scalar parse helper test
+query I
+SELECT hail_ld_parse_token(' chr1_201_AT_G ') AS p;
+----
+chr1_201_AT_G|chr1|201|AT|G|0
+
+query I
+SELECT hail_ld_parse_token('chr1_204_A_T') AS p;
+----
+chr1_204_A_T|chr1|204|A|T|1

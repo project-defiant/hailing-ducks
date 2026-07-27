@@ -1,0 +1,10 @@
+require quack
+
+# Ambiguous variant detection: >2 allele pairs at same contig:pos -> ambiguous (code 4)
+query II
+SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusA|chr1:1-1000| chr1_400_A_G, chr1_400_C_T, chr1_400_G_A')
+ORDER BY requested_variant_id;
+----
+chr1_400_A_G	4
+chr1_400_C_T	4
+chr1_400_G_A	4

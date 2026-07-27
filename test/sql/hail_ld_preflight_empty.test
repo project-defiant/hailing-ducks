@@ -1,0 +1,7 @@
+require quack
+
+# Empty input
+query I
+SELECT COUNT(*) FROM hail_ld_preflight('');
+----
+0

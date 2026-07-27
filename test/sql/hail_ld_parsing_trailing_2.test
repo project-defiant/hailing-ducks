@@ -1,0 +1,9 @@
+require quack
+
+# trailing commas - variant 2
+query I
+SELECT status_code FROM hail_ld_preflight('locusA|chr1:100-200|chr1_101_A_G,chr1_102_C_T,')
+WHERE requested_variant_id = 'chr1_102_C_T' LIMIT 1;
+----
+0
+

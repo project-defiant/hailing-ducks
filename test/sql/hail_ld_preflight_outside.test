@@ -1,0 +1,10 @@
+require quack
+
+# Outside-locus detection: variants outside supplied interval should be code 3
+query II
+SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusO|chr1:100-200| chr1_99_A_T, chr1_150_A_G, chr2_150_C_T')
+ORDER BY requested_variant_id;
+----
+chr1_150_A_G	0
+chr1_99_A_T	3
+chr2_150_C_T	3

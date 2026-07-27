@@ -1,0 +1,48 @@
+require quack
+
+# Parsing hygiene: trailing commas should be ignored - variant 1
+query I
+SELECT status_code FROM hail_ld_preflight('locusA|chr1:100-200|chr1_101_A_G,chr1_102_C_T,')
+WHERE requested_variant_id = 'chr1_101_A_G' LIMIT 1;
+----
+0
+
+# Parsing hygiene: trailing commas should be ignored - variant 2
+query I
+SELECT status_code FROM hail_ld_preflight('locusA|chr1:100-200|chr1_101_A_G,chr1_102_C_T,')
+WHERE requested_variant_id = 'chr1_102_C_T' LIMIT 1;
+----
+0
+
+# Whitespace around variants should be trimmed - variant 1
+query I
+SELECT status_code FROM hail_ld_preflight('locusB|chr1:100-210| chr1_201_A_G , chr1_202_C_T ')
+WHERE requested_variant_id = 'chr1_201_A_G' LIMIT 1;
+----
+0
+
+# Whitespace around variants should be trimmed - variant 2
+query I
+SELECT status_code FROM hail_ld_preflight('locusB|chr1:100-210| chr1_201_A_G , chr1_202_C_T ')
+WHERE requested_variant_id = 'chr1_202_C_T' LIMIT 1;
+----
+0
+
+# Repeated commas and empty tokens should be ignored - variant 1
+query I
+SELECT status_code FROM hail_ld_preflight('locusC|chr1:100-400|,chr1_301_A_G,,chr1_302_C_T,')
+WHERE requested_variant_id = 'chr1_301_A_G' LIMIT 1;
+----
+0
+
+# Repeated commas and empty tokens should be ignored - variant 2
+query I
+SELECT status_code FROM hail_ld_preflight('locusC|chr1:100-400|,chr1_301_A_G,,chr1_302_C_T,')
+WHERE requested_variant_id = 'chr1_302_C_T' LIMIT 1;
+----
+0
+
+# Empty variant list should return zero rows
+query I
+SELECT status_code FROM hail_ld_preflight('locusD|chr1:100-200|') LIMIT 1;
+----

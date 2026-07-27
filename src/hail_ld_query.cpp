@@ -107,14 +107,6 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
     // parse bind-time request_arg into rows, store in local state for chunked emission
     auto &bind = input.bind_data->Cast<PreflightBindData>();
     std::string s = bind.request_arg;
-    // debug: dump raw bind string bytes
-    {
-        FILE *f = fopen("test/hail_ld_input.log", "a");
-        if (f) {
-            fprintf(f, "BIND_ARG='%s' len=%zu\n", s.c_str(), s.size());
-            fclose(f);
-        }
-    }
     if (s.empty()) {
         return std::move(state);
     }
@@ -333,18 +325,6 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
         auto &r = local.rows[local.next + i];
         string locus_out = normalize(r.locus_id);
         string req_out = normalize(r.req);
-        // debug: write hex bytes of req_out to /tmp/hail_ld_emit.log
-        {
-            FILE *f = fopen("test/hail_ld_emit.log", "a");
-            if (f) {
-                fprintf(f, "EMIT ROW %zu: ", (size_t)(local.next + i));
-                for (unsigned char c : req_out) {
-                    fprintf(f, "%02x:", c);
-                }
-                fprintf(f, " -> '%s' len=%zu\n", req_out.c_str(), req_out.size());
-                fclose(f);
-            }
-        }
         FlatVector::GetData<string_t>(locus_vec)[i] = StringVector::AddString(locus_vec, locus_out.c_str());
         FlatVector::GetData<string_t>(req_vec)[i] = StringVector::AddString(req_vec, req_out.c_str());
         FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "variant");
@@ -366,15 +346,10 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
                                                                         GlobalTableFunctionState *) {
     auto state = make_uniq<DebugLocalState>();
     std::string s;
-    FILE *f = fopen("test/hail_ld_initlocal_debug.log", "a");
     if (input.bind_data) {
         auto &bind = input.bind_data->Cast<PreflightBindData>();
         s = bind.request_arg;
-        if (f) fprintf(f, "INITLOCAL_DEBUG: bind_data present, request_arg='%s'\n", s.c_str());
-    } else {
-        if (f) fprintf(f, "INITLOCAL_DEBUG: no bind_data available\n");
     }
-    if (f) fclose(f);
     if (s.empty()) return std::move(state);
     auto parts = StringUtil::Split(s, "|");
     if (parts.size() != 3) return std::move(state);
@@ -382,6 +357,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
     auto vars = StringUtil::Split(varlist, ',');
     std::unordered_set<std::string> seen;
     for (auto v : vars) {
+        std::string original_raw = v;
         StringUtil::Trim(v);
         // manual ASCII trim
         size_t start = 0;
@@ -420,7 +396,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
             auto is_base = [&](const std::string &a) { char C = a[0]; return a.size() == 1 && (C == 'A' || C == 'C' || C == 'G' || C == 'T'); };
             if (!is_base(ref) || !is_base(alt)) ok = 0;
         }
-        state->rows.push_back({v, stripped, contig, pos_str, ref, alt, ok});
+        state->rows.push_back({original_raw, stripped, contig, pos_str, ref, alt, ok});
     }
     return std::move(state);
 }
@@ -476,7 +452,6 @@ static void HailLDPreflightDebugScan(ClientContext &context, TableFunctionInput 
 
 
 void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
-    fprintf(stderr, "[hail_ld] RegisterHailLDQueryFunctions called\n");
     // status codes table function with explicit bind
     TableFunction status_func("hail_ld_status_codes", {}, HailLDStatusCodes, nullptr, nullptr);
     // Provide a bind that sets output schema
@@ -490,13 +465,11 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
         nullptr, HailLDStatusInitLocal
     );
     loader.RegisterFunction(status_func);
-    fprintf(stderr, "[hail_ld] registered status_func\n");
 
     // preflight function (simple string inline for TDD)
     TableFunction preflight_func("hail_ld_preflight", {LogicalType::VARCHAR}, HailLDPreflightScan,
                                 HailLDPreflightBind, HailLDPreflightInitGlobal, HailLDPreflightInitLocal);
     loader.RegisterFunction(preflight_func);
-    fprintf(stderr, "[hail_ld] registered hail_ld_preflight\n");
 
     // debug preflight parser inspection function
     TableFunction debug_func("hail_ld_preflight_debug", {LogicalType::VARCHAR}, HailLDPreflightDebugScan,
@@ -504,24 +477,14 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
             names = {"original_token", "stripped_token", "contig", "pos", "ref", "alt", "parse_ok"};
             return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
             auto bind_data = make_uniq<PreflightBindData>();
-            // debug logging
-            FILE *f = fopen("test/hail_ld_bind_debug.log", "a");
-            if (f) {
-                fprintf(f, "DEBUG_BIND called: inputs_empty=%d, input_count=%zu\n", input.inputs.empty() ? 1 : 0, input.inputs.size());
-                if (!input.inputs.empty()) {
-                    try { auto v = input.inputs[0].GetValue<string>(); fprintf(f, "DEBUG_BIND input[0]='%s'\n", v.c_str()); } catch (...) { fprintf(f, "DEBUG_BIND input[0] get failed\n"); }
-                }
-                fclose(f);
-            }
             if (!input.inputs.empty()) {
                 bind_data->request_arg = input.inputs[0].GetValue<string>();
             }
             return std::move(bind_data);
         },
 
-        nullptr, HailLDPreflightInitLocalDebug);
+        HailLDPreflightInitGlobal, HailLDPreflightInitLocalDebug);
     loader.RegisterFunction(debug_func);
-    fprintf(stderr, "[hail_ld] registered hail_ld_preflight_debug\n");
 
     // scalar helper: parse a single token into a tab-separated string for quick debug
     auto hail_ld_parse_scalar = ScalarFunction("hail_ld_parse_token", {LogicalType::VARCHAR}, LogicalType::VARCHAR,
@@ -559,7 +522,6 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
         }
     );
     loader.RegisterFunction(hail_ld_parse_scalar);
-    fprintf(stderr, "[hail_ld] registered hail_ld_parse_token scalar\n");
 }
 
 

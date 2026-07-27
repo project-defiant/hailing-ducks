@@ -1,0 +1,9 @@
+require quack
+
+# whitespace trimming - variant 2
+query I
+SELECT status_code FROM hail_ld_preflight('locusB|chr1:100-210| chr1_201_A_G , chr1_202_C_T ')
+WHERE requested_variant_id = 'chr1_202_C_T' LIMIT 1;
+----
+0
+
