@@ -72,6 +72,8 @@ static void HailLDStatusCodes(ClientContext &context, TableFunctionInput &data, 
 // Hail LD request preflight: validate request rows and emit variant status events
 // For TDD: implement basic parsing and status emission without HT/BM resolution.
 
+struct PreflightOutRow { std::string locus_id; std::string req; int32_t code; };
+
 struct PreflightBindData : public TableFunctionData {
     std::string request_arg;
 };
@@ -95,32 +97,16 @@ static unique_ptr<GlobalTableFunctionState> HailLDPreflightInitGlobal(ClientCont
 
 struct PreflightLocalState : public LocalTableFunctionState {
     // buffered output rows for this local scan
-    struct OutRow { std::string locus_id; std::string req; int32_t code; };
-    std::vector<OutRow> rows;
+    std::vector<PreflightOutRow> rows;
     idx_t next = 0;
 };
 
-static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionContext &context,
-                                                                   TableFunctionInitInput &input,
-                                                                   GlobalTableFunctionState *) {
-    auto state = make_uniq<PreflightLocalState>();
-    // parse bind-time request_arg into rows, store in local state for chunked emission
-    auto &bind = input.bind_data->Cast<PreflightBindData>();
-    std::string s = bind.request_arg;
-    if (s.empty()) {
-        return std::move(state);
-    }
-    auto parts = StringUtil::Split(s, "|");
-    if (parts.size() != 3) {
-        return std::move(state);
-    }
-    std::string locus_id = parts[0];
-    StringUtil::Trim(locus_id);
-    std::string locus_range = parts[1];
-    StringUtil::Trim(locus_range);
-    std::string varlist = parts[2];
-    auto vars = StringUtil::Split(varlist, ",");
-
+// Shared per-locus classification: parses raw variant tokens against a locus range and appends
+// variant-status events (dedupe, outside_locus, ambiguous/flipped allele grouping) to `rows`.
+// Used by both the single-locus inline function and the multi-locus request-file function.
+static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
+                                  const std::vector<std::string> &raw_tokens,
+                                  std::vector<PreflightOutRow> &rows) {
     // parse locus_range -> contig:start-end
     bool locus_ok = false;
     string locus_contig;
@@ -148,7 +134,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
     struct Parsed { string token; string contig; string pos; string ref; string alt; bool ok; };
     vector<Parsed> parsed_list;
     std::unordered_set<std::string> seen;
-    for (auto v : vars) {
+    for (auto v : raw_tokens) {
         // normalize each token: trim and skip empty tokens (from trailing/leading/repeated commas)
         StringUtil::Trim(v);
         // Manual trim fallback: remove ASCII isspace from ends
@@ -206,7 +192,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
         auto &p = parsed_list[i];
         if (!p.ok) {
             // emit unsupported immediately
-            state->rows.push_back({locus_id, p.token, 5});
+            rows.push_back({locus_id, p.token, 5});
             continue;
         }
         // outside-locus detection: if locus range parsed, ensure contig matches and pos within [start,end]
@@ -222,7 +208,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
             }
         }
         if (outside) {
-            state->rows.push_back({locus_id, p.token, 3});
+            rows.push_back({locus_id, p.token, 3});
             continue;
         }
         string key = p.contig + ":" + p.pos;
@@ -240,7 +226,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
         if (allele_pairs.size() > 2) {
             // ambiguous in HT-like sense: many allele pairs at same position
             for (auto idx : indices) {
-                state->rows.push_back({locus_id, parsed_list[idx].token, 4});
+                rows.push_back({locus_id, parsed_list[idx].token, 4});
             }
             continue;
         }
@@ -248,7 +234,7 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
             // single allele pair -> first encountered marked resolved_exact
             // preserve input order: emit rows for indices in order, first 0, others 0 as duplicates handled earlier
             for (auto idx : indices) {
-                state->rows.push_back({locus_id, parsed_list[idx].token, 0});
+                rows.push_back({locus_id, parsed_list[idx].token, 0});
             }
             continue;
         }
@@ -277,8 +263,8 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
             for (auto idx : indices) {
                 auto &p = parsed_list[idx];
                 string pair = p.ref + ":" + p.alt;
-                if (pair == first_pair) state->rows.push_back({locus_id, p.token, 0});
-                else state->rows.push_back({locus_id, p.token, 1});
+                if (pair == first_pair) rows.push_back({locus_id, p.token, 0});
+                else rows.push_back({locus_id, p.token, 1});
             }
         } else {
             // two distinct non-flip allele pairs -> mark first as 0, others as multiple_variants_at_position (6)
@@ -287,12 +273,36 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionCon
             for (auto idx : indices) {
                 auto &p = parsed_list[idx];
                 string pair = p.ref + ":" + p.alt;
-                if (first_pair.empty()) { first_pair = pair; state->rows.push_back({locus_id, p.token, 0}); }
-                else { state->rows.push_back({locus_id, p.token, 6}); }
+                if (first_pair.empty()) { first_pair = pair; rows.push_back({locus_id, p.token, 0}); }
+                else { rows.push_back({locus_id, p.token, 6}); }
             }
         }
     }
 
+}
+
+static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocal(ExecutionContext &context,
+                                                                   TableFunctionInitInput &input,
+                                                                   GlobalTableFunctionState *) {
+    auto state = make_uniq<PreflightLocalState>();
+    // parse bind-time request_arg into rows, store in local state for chunked emission
+    auto &bind = input.bind_data->Cast<PreflightBindData>();
+    std::string s = bind.request_arg;
+    if (s.empty()) {
+        return std::move(state);
+    }
+    auto parts = StringUtil::Split(s, "|");
+    if (parts.size() != 3) {
+        return std::move(state);
+    }
+    std::string locus_id = parts[0];
+    StringUtil::Trim(locus_id);
+    std::string locus_range = parts[1];
+    StringUtil::Trim(locus_range);
+    std::string varlist = parts[2];
+    auto raw_tokens = StringUtil::Split(varlist, ",");
+
+    ClassifyLocusVariants(locus_id, locus_range, raw_tokens, state->rows);
     return std::move(state);
 }
 
@@ -332,6 +342,54 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
     }
     local.next += to_emit;
     output.SetCardinality(to_emit);
+}
+
+// Multi-locus request file: reads a Parquet file with columns
+// (locus_id VARCHAR, locus VARCHAR, variant_ids LIST<VARCHAR>), one row per fine-mapping locus,
+// and classifies each locus's variant list the same way hail_ld_preflight does for a single locus.
+struct PreflightRequestsBindData : public TableFunctionData {
+    std::vector<PreflightOutRow> rows;
+};
+
+static unique_ptr<FunctionData> HailLDPreflightRequestsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                            vector<LogicalType> &return_types, vector<string> &names) {
+    names = {"locus_id", "requested_variant_id", "status_domain", "status_code"};
+    return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
+    auto bind_data = make_uniq<PreflightRequestsBindData>();
+    if (input.inputs.empty()) {
+        return std::move(bind_data);
+    }
+    std::string requests_path = input.inputs[0].GetValue<string>();
+    std::string escaped_path = StringUtil::Replace(requests_path, "'", "''");
+
+    Connection con(*context.db);
+    auto result = con.Query("SELECT locus_id, locus, variant_ids FROM read_parquet('" + escaped_path + "')");
+    if (result->HasError()) {
+        throw BinderException("hail_ld_preflight_requests: failed to read request file '%s': %s",
+                              requests_path, result->GetError());
+    }
+    while (auto chunk = result->Fetch()) {
+        for (idx_t row = 0; row < chunk->size(); ++row) {
+            std::string locus_id = chunk->GetValue(0, row).GetValue<string>();
+            std::string locus_range = chunk->GetValue(1, row).GetValue<string>();
+            auto variant_ids_value = chunk->GetValue(2, row);
+            std::vector<std::string> raw_tokens;
+            for (auto &item : ListValue::GetChildren(variant_ids_value)) {
+                raw_tokens.push_back(item.GetValue<string>());
+            }
+            ClassifyLocusVariants(locus_id, locus_range, raw_tokens, bind_data->rows);
+        }
+    }
+    return std::move(bind_data);
+}
+
+static unique_ptr<LocalTableFunctionState> HailLDPreflightRequestsInitLocal(ExecutionContext &context,
+                                                                            TableFunctionInitInput &input,
+                                                                            GlobalTableFunctionState *) {
+    auto state = make_uniq<PreflightLocalState>();
+    auto &bind = input.bind_data->Cast<PreflightRequestsBindData>();
+    state->rows = bind.rows;
+    return std::move(state);
 }
 
 // Debug table function: emit parsed parts for each token for inspection
@@ -470,6 +528,11 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
     TableFunction preflight_func("hail_ld_preflight", {LogicalType::VARCHAR}, HailLDPreflightScan,
                                 HailLDPreflightBind, HailLDPreflightInitGlobal, HailLDPreflightInitLocal);
     loader.RegisterFunction(preflight_func);
+
+    // multi-locus request file: Parquet with (locus_id, locus, variant_ids LIST<VARCHAR>) rows
+    TableFunction requests_func("hail_ld_preflight_requests", {LogicalType::VARCHAR}, HailLDPreflightScan,
+                                HailLDPreflightRequestsBind, HailLDPreflightInitGlobal, HailLDPreflightRequestsInitLocal);
+    loader.RegisterFunction(requests_func);
 
     // debug preflight parser inspection function
     TableFunction debug_func("hail_ld_preflight_debug", {LogicalType::VARCHAR}, HailLDPreflightDebugScan,

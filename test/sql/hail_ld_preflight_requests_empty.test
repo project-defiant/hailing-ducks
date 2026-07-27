@@ -1,0 +1,15 @@
+require quack
+
+require parquet
+
+# An empty request file (0 locus rows) should return zero rows
+statement ok
+COPY (
+  SELECT * FROM (VALUES ('x', 'chr1:1-10', ['chr1_1_A_T'])) AS t(locus_id, locus, variant_ids)
+  WHERE false
+) TO '__TEST_DIR__/hail_ld_preflight_requests_empty.parquet' (FORMAT PARQUET);
+
+query I
+SELECT COUNT(*) FROM hail_ld_preflight_requests('__TEST_DIR__/hail_ld_preflight_requests_empty.parquet');
+----
+0

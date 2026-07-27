@@ -1,0 +1,9 @@
+require quack
+
+require parquet
+
+# A nonexistent request file path should surface a structural error, not crash or silently return 0 rows
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight_requests('__TEST_DIR__/does_not_exist.parquet');
+----
+hail_ld_preflight_requests: failed to read request file
