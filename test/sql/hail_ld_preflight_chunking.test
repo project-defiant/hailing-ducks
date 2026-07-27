@@ -1,0 +1,130 @@
+# name: test/sql/hail_ld_preflight_chunking.test
+# group: [sql]
+
+require quack
+
+# Chunking tests with CHUNK_SIZE=16 (in-extension test override)
+
+# 0 items
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-10| ')
+ORDER BY requested_variant_id;
+----
+
+# 1 item
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-10| chr1_1_A_T ')
+ORDER BY requested_variant_id;
+----
+chr1_1_A_T
+
+# 15 items (CHUNK_SIZE-1)
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-100| 
+chr1_1_A_T, chr1_2_A_T, chr1_3_A_T, chr1_4_A_T, chr1_5_A_T, chr1_6_A_T, chr1_7_A_T, chr1_8_A_T, chr1_9_A_T, chr1_10_A_T, chr1_11_A_T, chr1_12_A_T, chr1_13_A_T, chr1_14_A_T, chr1_15_A_T')
+ORDER BY requested_variant_id;
+----
+chr1_10_A_T
+chr1_11_A_T
+chr1_12_A_T
+chr1_13_A_T
+chr1_14_A_T
+chr1_15_A_T
+chr1_1_A_T
+chr1_2_A_T
+chr1_3_A_T
+chr1_4_A_T
+chr1_5_A_T
+chr1_6_A_T
+chr1_7_A_T
+chr1_8_A_T
+chr1_9_A_T
+
+# 16 items (CHUNK_SIZE)
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-100| 
+chr1_1_A_T, chr1_2_A_T, chr1_3_A_T, chr1_4_A_T, chr1_5_A_T, chr1_6_A_T, chr1_7_A_T, chr1_8_A_T, chr1_9_A_T, chr1_10_A_T, chr1_11_A_T, chr1_12_A_T, chr1_13_A_T, chr1_14_A_T, chr1_15_A_T, chr1_16_A_T')
+ORDER BY requested_variant_id;
+----
+chr1_10_A_T
+chr1_11_A_T
+chr1_12_A_T
+chr1_13_A_T
+chr1_14_A_T
+chr1_15_A_T
+chr1_16_A_T
+chr1_1_A_T
+chr1_2_A_T
+chr1_3_A_T
+chr1_4_A_T
+chr1_5_A_T
+chr1_6_A_T
+chr1_7_A_T
+chr1_8_A_T
+chr1_9_A_T
+
+# 17 items (CHUNK_SIZE+1)
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-100| 
+chr1_1_A_T, chr1_2_A_T, chr1_3_A_T, chr1_4_A_T, chr1_5_A_T, chr1_6_A_T, chr1_7_A_T, chr1_8_A_T, chr1_9_A_T, chr1_10_A_T, chr1_11_A_T, chr1_12_A_T, chr1_13_A_T, chr1_14_A_T, chr1_15_A_T, chr1_16_A_T, chr1_17_A_T')
+ORDER BY requested_variant_id;
+----
+chr1_10_A_T
+chr1_11_A_T
+chr1_12_A_T
+chr1_13_A_T
+chr1_14_A_T
+chr1_15_A_T
+chr1_16_A_T
+chr1_17_A_T
+chr1_1_A_T
+chr1_2_A_T
+chr1_3_A_T
+chr1_4_A_T
+chr1_5_A_T
+chr1_6_A_T
+chr1_7_A_T
+chr1_8_A_T
+chr1_9_A_T
+
+# 35 items (2*CHUNK_SIZE+3)
+query I
+SELECT requested_variant_id FROM hail_ld_preflight('locusC|1:1-200| 
+chr1_1_A_T, chr1_2_A_T, chr1_3_A_T, chr1_4_A_T, chr1_5_A_T, chr1_6_A_T, chr1_7_A_T, chr1_8_A_T, chr1_9_A_T, chr1_10_A_T, chr1_11_A_T, chr1_12_A_T, chr1_13_A_T, chr1_14_A_T, chr1_15_A_T, chr1_16_A_T, chr1_17_A_T, chr1_18_A_T, chr1_19_A_T, chr1_20_A_T, chr1_21_A_T, chr1_22_A_T, chr1_23_A_T, chr1_24_A_T, chr1_25_A_T, chr1_26_A_T, chr1_27_A_T, chr1_28_A_T, chr1_29_A_T, chr1_30_A_T, chr1_31_A_T, chr1_32_A_T, chr1_33_A_T, chr1_34_A_T, chr1_35_A_T')
+ORDER BY requested_variant_id;
+----
+chr1_10_A_T
+chr1_11_A_T
+chr1_12_A_T
+chr1_13_A_T
+chr1_14_A_T
+chr1_15_A_T
+chr1_16_A_T
+chr1_17_A_T
+chr1_18_A_T
+chr1_19_A_T
+chr1_1_A_T
+chr1_20_A_T
+chr1_21_A_T
+chr1_22_A_T
+chr1_23_A_T
+chr1_24_A_T
+chr1_25_A_T
+chr1_26_A_T
+chr1_27_A_T
+chr1_28_A_T
+chr1_29_A_T
+chr1_2_A_T
+chr1_30_A_T
+chr1_31_A_T
+chr1_32_A_T
+chr1_33_A_T
+chr1_34_A_T
+chr1_35_A_T
+chr1_3_A_T
+chr1_4_A_T
+chr1_5_A_T
+chr1_6_A_T
+chr1_7_A_T
+chr1_8_A_T
+chr1_9_A_T

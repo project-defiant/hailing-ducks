@@ -1,0 +1,31 @@
+# name: test/sql/hail_ld_preflight_malformed_locus.test
+# group: [sql]
+
+require quack
+
+# A malformed locus range is a structural error, not something to silently ignore
+# (silently skipping outside-locus filtering would let out-of-range variants through undetected).
+
+# missing ':'
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight('locus1|chr1100-200|chr1_150_A_G');
+----
+hail_ld_preflight: malformed locus range
+
+# missing '-'
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight('locus1|chr1:100200|chr1_150_A_G');
+----
+hail_ld_preflight: malformed locus range
+
+# non-integer bounds
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight('locus1|chr1:abc-def|chr1_150_A_G');
+----
+hail_ld_preflight: malformed locus range
+
+# start > end
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight('locus1|chr1:200-100|chr1_150_A_G');
+----
+hail_ld_preflight: malformed locus range

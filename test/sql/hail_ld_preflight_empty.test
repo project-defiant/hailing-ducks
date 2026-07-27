@@ -1,0 +1,10 @@
+# name: test/sql/hail_ld_preflight_empty.test
+# group: [sql]
+
+require quack
+
+# Empty input
+query I
+SELECT COUNT(*) FROM hail_ld_preflight('');
+----
+0

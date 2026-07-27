@@ -1,0 +1,25 @@
+# name: test/sql/hail_ld_preflight_requests.test
+# group: [sql]
+
+require quack
+
+require parquet
+
+# Multi-locus request file: locus_id, locus, variant_ids LIST<VARCHAR>
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('locus1', 'chr1:1000-2000', ['chr1_1001_A_G', 'chr1_1002_C_T', 'chr1_1001_A_G']),
+    ('locus2', 'chr2:500-600', ['chr2_550_A_G', 'chr2_700_A_G'])
+  ) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_preflight_requests.parquet' (FORMAT PARQUET);
+
+query IIII
+SELECT locus_id, requested_variant_id, status_domain, status_code
+FROM hail_ld_preflight_requests('__TEST_DIR__/hail_ld_preflight_requests.parquet')
+ORDER BY locus_id, requested_variant_id;
+----
+locus1	chr1_1001_A_G	variant	0
+locus1	chr1_1002_C_T	variant	0
+locus2	chr2_550_A_G	variant	0
+locus2	chr2_700_A_G	variant	3

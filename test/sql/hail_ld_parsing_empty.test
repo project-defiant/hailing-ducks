@@ -1,0 +1,11 @@
+# name: test/sql/hail_ld_parsing_empty.test
+# group: [sql]
+
+require quack
+
+# empty variant list returns zero rows
+query I
+SELECT status_code FROM hail_ld_preflight('locusD|chr1:100-200|') LIMIT 1;
+----
+
+

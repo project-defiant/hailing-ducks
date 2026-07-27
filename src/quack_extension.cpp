@@ -5,6 +5,7 @@
 #include "hail_codec.hpp"
 #include "hail_table_scanner.hpp"
 #include "hail_type_parser.hpp"
+#include "hail_ld_query.hpp"
 #include "duckdb.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/function/scalar_function.hpp"
@@ -69,10 +70,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	HailCodecScanFunction::Register(loader);
 	HailTableScanFunction::Register(loader);
 
-    // Register new LD query / status functions
-    RegisterHailLDQueryFunctions(loader);
+	// Register new LD query / status functions
+	RegisterHailLDQueryFunctions(loader);
 }
-
 
 void QuackExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

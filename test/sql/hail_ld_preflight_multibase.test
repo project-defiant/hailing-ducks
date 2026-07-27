@@ -1,0 +1,14 @@
+# name: test/sql/hail_ld_preflight_multibase.test
+# group: [sql]
+
+require quack
+
+# Multi-base allele / indel / 'N' handling
+query II
+SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusX|chr1:1-300| chr1_201_AT_G , chr1_202_A_GG , chr1_203_N_A , chr1_204_A_T ')
+ORDER BY requested_variant_id;
+----
+chr1_201_AT_G	5
+chr1_202_A_GG	5
+chr1_203_N_A	5
+chr1_204_A_T	0

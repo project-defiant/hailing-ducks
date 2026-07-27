@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight.test
+# group: [sql]
+
 require quack
 
 # Test hail_ld_status_codes returns known codes

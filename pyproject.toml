@@ -1,0 +1,11 @@
+[project]
+name = "hailing-ducks"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "black>=26.5.1",
+    "clang-tools>=1.2.0",
+    "cmakelang>=0.6.13",
+]

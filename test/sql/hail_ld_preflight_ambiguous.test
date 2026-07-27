@@ -1,0 +1,13 @@
+# name: test/sql/hail_ld_preflight_ambiguous.test
+# group: [sql]
+
+require quack
+
+# Same-position conflict: >2 distinct allele pairs at same contig:pos -> multiple_variants_at_position (code 6)
+query II
+SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusA|chr1:1-1000| chr1_400_A_G, chr1_400_C_T, chr1_400_G_A')
+ORDER BY requested_variant_id;
+----
+chr1_400_A_G	6
+chr1_400_C_T	6
+chr1_400_G_A	6
