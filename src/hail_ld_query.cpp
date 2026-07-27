@@ -1,5 +1,6 @@
 #include "hail_ld_query.hpp"
 #include "hail_table_scanner.hpp"
+#include "hail_blockmatrix_scanner.hpp"
 #include "hail_codec.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
@@ -17,6 +18,9 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <regex>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace duckdb {
 
@@ -835,6 +839,218 @@ static void HailLDResolveHTScan(ClientContext &context, TableFunctionInput &data
 	output.SetCardinality(to_emit);
 }
 
+// ---------------------------------------------------------------------------
+// hail_ld_bm_pairs(bm_path, resolved): BlockMatrix pair extraction for one locus
+// ---------------------------------------------------------------------------
+
+struct BMResolvedVariant {
+	int64_t idx;
+	int32_t allele_order;
+};
+
+struct BMPairOutRow {
+	int64_t idx_i;
+	int64_t idx_j;
+	double r = 0.0;
+	bool has_r = false;
+	int32_t status_code;
+};
+
+struct HailLDBMPairsBindData : public TableFunctionData {
+	std::vector<BMPairOutRow> rows;
+};
+
+static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"idx_i", "idx_j", "r", "bm_status_domain", "bm_status_code"};
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::VARCHAR,
+	                LogicalType::INTEGER};
+	auto bind_data = make_uniq<HailLDBMPairsBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string bm_path = input.inputs[0].GetValue<string>();
+
+	std::vector<BMResolvedVariant> resolved;
+	for (auto &item : ListValue::GetChildren(input.inputs[1])) {
+		if (item.IsNull()) {
+			continue;
+		}
+		auto &fields = StructValue::GetChildren(item);
+		resolved.push_back({fields[0].GetValue<int64_t>(), fields[1].GetValue<int32_t>()});
+	}
+	// Canonical pair generation (idx_i < idx_j) falls out naturally from generating pairs over a
+	// sorted-by-idx list, rather than sorting each pair individually.
+	std::sort(resolved.begin(), resolved.end(),
+	          [](const BMResolvedVariant &a, const BMResolvedVariant &b) { return a.idx < b.idx; });
+	if (resolved.size() < 2) {
+		return std::move(bind_data); // fewer than 2 resolved variants -> no pairs to form
+	}
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadBlockMatrixMetadata(fs, bm_path);
+	int64_t n_block_cols = (metadata.n_cols + metadata.block_size - 1) / metadata.block_size;
+
+	std::unordered_map<int32_t, idx_t> block_idx_to_part_pos;
+	for (idx_t i = 0; i < metadata.block_indices.size(); ++i) {
+		block_idx_to_part_pos[metadata.block_indices[i]] = i;
+	}
+
+	// Decoded-block cache, keyed by flat block index: a block file is opened and decompressed lazily
+	// on first need, then reused for every later pair whose cell falls in the same block -- this is
+	// what makes each touched block get read once per this locus's whole pair set. "Confirmed
+	// missing" is memoized too, so a repeatedly-requested absent block isn't re-looked-up either.
+	struct DecodedBlock {
+		std::vector<double> data;
+		bool is_transpose;
+		int64_t block_n_rows, block_n_cols;
+	};
+	std::unordered_map<int32_t, unique_ptr<DecodedBlock>> block_cache;
+	std::unordered_set<int32_t> confirmed_missing;
+
+	// Returns the raw (uncorrected) cell value at (row, col); sets out_missing_block when the block
+	// containing this cell has no physical part file (Hail's `maybeFiltered` sparse storage).
+	auto get_cell = [&](int64_t row, int64_t col, bool &out_missing_block) -> double {
+		int64_t block_row = row / metadata.block_size;
+		int64_t block_col = col / metadata.block_size;
+		int32_t block_idx = static_cast<int32_t>(block_row * n_block_cols + block_col);
+
+		if (confirmed_missing.count(block_idx)) {
+			out_missing_block = true;
+			return 0.0;
+		}
+		auto cache_it = block_cache.find(block_idx);
+		if (cache_it == block_cache.end()) {
+			auto pos_it = block_idx_to_part_pos.find(block_idx);
+			if (pos_it == block_idx_to_part_pos.end()) {
+				confirmed_missing.insert(block_idx);
+				out_missing_block = true;
+				return 0.0;
+			}
+			std::string part_path = bm_path + "/parts/" + metadata.part_files[pos_it->second];
+			auto handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			std::vector<uint8_t> raw = DecompressHailLz4Stream(*handle, part_path);
+			if (raw.size() < 9) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block file too small: " + part_path);
+			}
+			size_t cursor = 0;
+			auto read32 = [&]() -> int32_t {
+				int32_t v = static_cast<int32_t>(raw[cursor]) | (static_cast<int32_t>(raw[cursor + 1]) << 8) |
+				            (static_cast<int32_t>(raw[cursor + 2]) << 16) |
+				            (static_cast<int32_t>(raw[cursor + 3]) << 24);
+				cursor += 4;
+				return v;
+			};
+			int32_t stored_rows = read32();
+			int32_t stored_cols = read32();
+			bool is_transpose = (raw[cursor++] != 0);
+			auto bi = ComputeBlockMatrixBlockInfo(block_idx, metadata.block_size, metadata.n_rows, metadata.n_cols);
+			if (stored_rows != bi.block_n_rows || stored_cols != bi.block_n_cols) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block dimension mismatch in " + part_path);
+			}
+			int64_t n_elements = static_cast<int64_t>(stored_rows) * stored_cols;
+			size_t data_bytes = static_cast<size_t>(n_elements) * sizeof(double);
+			if (raw.size() - cursor < data_bytes) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block file data truncated: " + part_path);
+			}
+			auto block = make_uniq<DecodedBlock>();
+			block->data.resize(n_elements);
+			std::memcpy(block->data.data(), raw.data() + cursor, data_bytes);
+			block->is_transpose = is_transpose;
+			block->block_n_rows = bi.block_n_rows;
+			block->block_n_cols = bi.block_n_cols;
+			cache_it = block_cache.emplace(block_idx, std::move(block)).first;
+		}
+		auto &block = *cache_it->second;
+		int64_t local_row = row - block_row * metadata.block_size;
+		int64_t local_col = col - block_col * metadata.block_size;
+		int64_t elem_idx = block.is_transpose ? (local_row * block.block_n_cols + local_col)
+		                                      : (local_col * block.block_n_rows + local_row);
+		return block.data[elem_idx];
+	};
+
+	for (idx_t a = 0; a < resolved.size(); ++a) {
+		for (idx_t b = a + 1; b < resolved.size(); ++b) {
+			auto &vi = resolved[a];
+			auto &vj = resolved[b];
+			if (vi.idx == vj.idx) {
+				continue; // never emit a diagonal row, even defensively against duplicate input idx
+			}
+			BMPairOutRow out;
+			out.idx_i = vi.idx;
+			out.idx_j = vj.idx;
+			if (vi.idx < 0 || vi.idx >= metadata.n_rows || vj.idx < 0 || vj.idx >= metadata.n_cols) {
+				out.status_code = 2; // bm_index_out_of_bounds
+				bind_data->rows.push_back(out);
+				continue;
+			}
+			bool missing_block = false;
+			double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
+			if (missing_block) {
+				out.status_code = 3; // bm_missing_block
+			} else if (std::isnan(raw_value)) {
+				out.status_code = 4; // bm_missing_or_nan
+			} else {
+				out.has_r = true;
+				out.r = raw_value * vi.allele_order * vj.allele_order;
+				out.status_code = 0; // bm_resolved
+			}
+			bind_data->rows.push_back(out);
+		}
+	}
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDBMPairsInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct BMPairsLocalState : public LocalTableFunctionState {
+	std::vector<BMPairOutRow> rows;
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDBMPairsInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<BMPairsLocalState>();
+	auto &bind = input.bind_data->Cast<HailLDBMPairsBindData>();
+	state->rows = bind.rows;
+	return std::move(state);
+}
+
+static void HailLDBMPairsScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<BMPairsLocalState>();
+	if (local.next >= local.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, local.rows.size() - local.next);
+
+	auto &idx_i_vec = output.data[0];
+	auto &idx_j_vec = output.data[1];
+	auto &r_vec = output.data[2];
+	auto &dom_vec = output.data[3];
+	auto &code_vec = output.data[4];
+
+	for (idx_t i = 0; i < to_emit; ++i) {
+		auto &row = local.rows[local.next + i];
+		FlatVector::GetData<int64_t>(idx_i_vec)[i] = row.idx_i;
+		FlatVector::GetData<int64_t>(idx_j_vec)[i] = row.idx_j;
+		if (row.has_r) {
+			FlatVector::GetData<double>(r_vec)[i] = row.r;
+		} else {
+			FlatVector::SetNull(r_vec, i, true);
+		}
+		FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "bm");
+		FlatVector::GetData<int32_t>(code_vec)[i] = row.status_code;
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
+}
+
 // Debug table function: emit parsed parts for each token for inspection
 struct DebugLocalState : public LocalTableFunctionState {
 	struct Row {
@@ -1017,6 +1233,14 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 	                              HailLDResolveHTScan, HailLDResolveHTBind, HailLDResolveHTInitGlobal,
 	                              HailLDResolveHTInitLocal);
 	loader.RegisterFunction(resolve_ht_func);
+
+	// BlockMatrix pair extraction: strict canonical pairs among one locus's resolved variants
+	child_list_t<LogicalType> resolved_struct_fields = {{"idx", LogicalType::BIGINT},
+	                                                    {"allele_order", LogicalType::INTEGER}};
+	TableFunction bm_pairs_func("hail_ld_bm_pairs",
+	                            {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::STRUCT(resolved_struct_fields))},
+	                            HailLDBMPairsScan, HailLDBMPairsBind, HailLDBMPairsInitGlobal, HailLDBMPairsInitLocal);
+	loader.RegisterFunction(bm_pairs_func);
 
 	// debug preflight parser inspection function
 	TableFunction debug_func(
