@@ -1,0 +1,33 @@
+# name: test/sql/hail_ld_preflight_requests_null.test
+# group: [sql]
+
+require quack
+
+require parquet
+
+# NULL locus_id/locus/variant_ids columns must surface a structural error, not crash or silently drop rows
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('locus1', 'chr1:1000-2000', ['chr1_1001_A_G']),
+    (NULL, 'chr1:1000-2000', ['chr1_1001_A_G'])
+  ) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_preflight_requests_null_locus_id.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight_requests('__TEST_DIR__/hail_ld_preflight_requests_null_locus_id.parquet');
+----
+hail_ld_preflight_requests: request file
+
+# NULL entry inside variant_ids
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('locus2', 'chr1:1000-2000', ['chr1_1001_A_G', NULL])
+  ) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_preflight_requests_null_variant.parquet' (FORMAT PARQUET);
+
+statement error
+SELECT COUNT(*) FROM hail_ld_preflight_requests('__TEST_DIR__/hail_ld_preflight_requests_null_variant.parquet');
+----
+hail_ld_preflight_requests: request file

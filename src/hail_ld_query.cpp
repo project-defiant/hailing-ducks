@@ -115,10 +115,12 @@ struct PreflightLocalState : public LocalTableFunctionState {
 // Used by both the single-locus inline function and the multi-locus request-file function.
 static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
                                   const std::vector<std::string> &raw_tokens, std::vector<PreflightOutRow> &rows) {
-	// parse locus_range -> contig:start-end
-	bool locus_ok = false;
+	// parse locus_range -> contig:start-end; a malformed range is a structural error, not something
+	// to silently ignore (silently skipping outside-locus filtering would let out-of-range variants
+	// through undetected).
 	string locus_contig;
 	int64_t locus_start = 0, locus_end = 0;
+	bool malformed = true;
 	if (!locus_range.empty()) {
 		// expect e.g. chr1:100-200
 		auto colon = locus_range.find(':');
@@ -132,13 +134,19 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 				try {
 					locus_start = stoll(sstart);
 					locus_end = stoll(send);
-					locus_ok = (locus_start <= locus_end);
+					malformed = !(locus_start <= locus_end);
 				} catch (...) {
-					locus_ok = false;
+					malformed = true;
 				}
 			}
 		}
 	}
+	if (malformed) {
+		throw BinderException("hail_ld_preflight: malformed locus range '%s' for locus_id '%s' (expected "
+		                      "'<contig>:<start>-<end>' with start <= end)",
+		                      locus_range, locus_id);
+	}
+	const bool locus_ok = true;
 
 	// temp parsed list preserves order
 	struct Parsed {
@@ -253,9 +261,11 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 			allele_pairs.insert(p.ref + ":" + p.alt);
 		}
 		if (allele_pairs.size() > 2) {
-			// ambiguous in HT-like sense: many allele pairs at same position
+			// request-level conflict (>2 distinct allele pairs at the same contig/position): exclude
+			// from LD planning before any HT work. Code 4 (ambiguous_in_ht) is reserved for ambiguity
+			// discovered later, during HT resolution.
 			for (auto idx : indices) {
-				rows.push_back({locus_id, parsed_list[idx].token, 4});
+				rows.push_back({locus_id, parsed_list[idx].token, 6});
 			}
 			continue;
 		}
@@ -304,18 +314,11 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 					rows.push_back({locus_id, p.token, 1});
 			}
 		} else {
-			// two distinct non-flip allele pairs -> mark first as 0, others as multiple_variants_at_position (6)
-			// first encountered pair
-			string first_pair = "";
+			// two distinct non-flip allele pairs at the same position -> request-level conflict:
+			// exclude ALL of them from LD planning (multiple_variants_at_position, 6), not just the
+			// later-encountered ones, since none can be trusted as the single intended variant.
 			for (auto idx : indices) {
-				auto &p = parsed_list[idx];
-				string pair = p.ref + ":" + p.alt;
-				if (first_pair.empty()) {
-					first_pair = pair;
-					rows.push_back({locus_id, p.token, 0});
-				} else {
-					rows.push_back({locus_id, p.token, 6});
-				}
+				rows.push_back({locus_id, parsed_list[idx].token, 6});
 			}
 		}
 	}
@@ -411,11 +414,24 @@ static unique_ptr<FunctionData> HailLDPreflightRequestsBind(ClientContext &conte
 	}
 	while (auto chunk = result->Fetch()) {
 		for (idx_t row = 0; row < chunk->size(); ++row) {
-			std::string locus_id = chunk->GetValue(0, row).GetValue<string>();
-			std::string locus_range = chunk->GetValue(1, row).GetValue<string>();
+			auto locus_id_value = chunk->GetValue(0, row);
+			auto locus_range_value = chunk->GetValue(1, row);
 			auto variant_ids_value = chunk->GetValue(2, row);
+			if (locus_id_value.IsNull() || locus_range_value.IsNull() || variant_ids_value.IsNull()) {
+				throw BinderException(
+				    "hail_ld_preflight_requests: request file '%s' row %d has a NULL locus_id/locus/variant_ids "
+				    "column; all three columns are required",
+				    requests_path, (int)row);
+			}
+			std::string locus_id = locus_id_value.GetValue<string>();
+			std::string locus_range = locus_range_value.GetValue<string>();
 			std::vector<std::string> raw_tokens;
 			for (auto &item : ListValue::GetChildren(variant_ids_value)) {
+				if (item.IsNull()) {
+					throw BinderException("hail_ld_preflight_requests: request file '%s' locus_id '%s' has a NULL "
+					                      "entry in variant_ids; all requested variant IDs must be non-NULL",
+					                      requests_path, locus_id);
+				}
 				raw_tokens.push_back(item.GetValue<string>());
 			}
 			ClassifyLocusVariants(locus_id, locus_range, raw_tokens, bind_data->rows);
