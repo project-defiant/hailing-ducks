@@ -712,6 +712,17 @@ static std::vector<HTResolveOutRow> ResolveHTCore(ClientContext &context, const 
 				if (!DecodeHailTableRow(*decoder, metadata.etype, row_chunk, 0)) {
 					break;
 				}
+				// `locus` is nullable in real Hail wire format (e.g. a row whose liftover to this
+				// build failed) -- StructValue::GetChildren throws on a NULL struct, so a row with no
+				// locus can't be positioned at all and must be skipped before touching its children.
+				auto locus_value = row_chunk.GetValue(locus_col, 0);
+				if (locus_value.IsNull()) {
+					continue;
+				}
+				auto &locus_children = StructValue::GetChildren(locus_value);
+				std::string row_contig = locus_children[0].GetValue<string>();
+				int64_t row_pos = locus_children[1].GetValue<int32_t>();
+
 				auto alleles_value = row_chunk.GetValue(alleles_col, 0);
 				if (alleles_value.IsNull()) {
 					continue;
@@ -724,11 +735,6 @@ static std::vector<HTResolveOutRow> ResolveHTCore(ClientContext &context, const 
 				if (allele_children[0].IsNull() || allele_children[1].IsNull()) {
 					continue;
 				}
-
-				auto locus_value = row_chunk.GetValue(locus_col, 0);
-				auto &locus_children = StructValue::GetChildren(locus_value);
-				std::string row_contig = locus_children[0].GetValue<string>();
-				int64_t row_pos = locus_children[1].GetValue<int32_t>();
 
 				auto pos_it = candidates_by_pos.find(row_contig + ":" + std::to_string(row_pos));
 				if (pos_it == candidates_by_pos.end()) {

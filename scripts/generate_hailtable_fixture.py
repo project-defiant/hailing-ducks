@@ -320,25 +320,28 @@ def write_optional_array_fixture(fixture_dir: Path, codec: str):
 # s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht/rows/metadata.json.gz:
 # _key = ["locus", "alleles"]; _jRangeBounds is one entry per partition, each
 # {"start": {"locus": {...}, "alleles": [...]}, "end": {...}, "includeStart",
-# "includeEnd"}. `alleles` is an OPTIONAL top-level field on real tables (no
-# leading '+' in the real _eType), so this fixture also includes one row with
-# a NULL allele list to exercise that path.
+# "includeEnd"}. Both `locus` and `alleles` are OPTIONAL top-level fields on real tables (no
+# leading '+' in the real _eType -- confirmed against the same real metadata: a failed-liftover
+# row, for instance, can have a NULL locus), so this fixture includes one row with a NULL locus
+# and one with a NULL allele list, to exercise both paths.
 # ---------------------------------------------------------------------------
 
 LD_VTYPE = "Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String]}"
-LD_ETYPE = "+EBaseStruct{idx:+EInt64,locus:+EBaseStruct{contig:+EBinary,position:+EInt32},alleles:EArray[EBinary]}"
+LD_ETYPE = "+EBaseStruct{idx:+EInt64,locus:EBaseStruct{contig:+EBinary,position:+EInt32},alleles:EArray[EBinary]}"
 
 # Three partitions: two spanning distinct chr1 sub-ranges (to test position-based pruning within a
 # contig) and one on chr2 (to test contig-based pruning). Row contents cover: an exact match, a
 # flipped match, a multi-allelic row colliding with a request (must NOT be coerced into a match), a
 # row with no matching request (not_found_in_ht), two same-position rows that both match one request
-# in opposite orientations (ambiguous_in_ht), and a NULL-alleles row (must be skipped, not crash).
+# in opposite orientations (ambiguous_in_ht), a NULL-alleles row, and a NULL-locus row (both must be
+# skipped during scanning, not crash).
 LD_PARTITIONS = [
     [
         {"idx": 0, "locus": ("chr1", 150), "alleles": None},
         {"idx": 1, "locus": ("chr1", 200), "alleles": ["A", "G"]},
         {"idx": 2, "locus": ("chr1", 300), "alleles": ["G", "A"]},
         {"idx": 3, "locus": ("chr1", 400), "alleles": ["A", "G", "T"]},
+        {"idx": 8, "locus": None, "alleles": ["A", "G"]},
     ],
     [
         {"idx": 4, "locus": ("chr1", 700), "alleles": ["C", "T"]},
@@ -352,16 +355,20 @@ LD_PARTITIONS = [
 
 
 def encode_ld_row(row: dict) -> bytes:
-    # Row struct has exactly 1 optional field (alleles, no leading '+' in LD_ETYPE) -> a 1-byte
-    # missing-bit prefix, read/written before any field (same rule as encode_optional_row above).
+    # Row struct has 2 optional fields, in LD_ETYPE field declaration order (idx is required -> no
+    # bit; locus is the 1st optional field -> bit 0; alleles is the 2nd -> bit 1), matching
+    # DecodeValue's general missing-bit-prefix algorithm (bit position = order among optional fields
+    # only, not overall field position).
+    locus = row["locus"]
     alleles = row["alleles"]
-    missing_byte = 0b1 if alleles is None else 0b0
+    missing_byte = (0b01 if locus is None else 0) | (0b10 if alleles is None else 0)
     out = bytearray()
     out += bytes([missing_byte])
     out += leb128_u(row["idx"])              # idx: EInt64, required
-    contig, position = row["locus"]
-    out += encode_string(contig)              # locus.contig: EBinary, required
-    out += leb128_u(position)                  # locus.position: EInt32, required
+    if locus is not None:
+        contig, position = locus
+        out += encode_string(contig)          # locus.contig: EBinary, required
+        out += leb128_u(position)              # locus.position: EInt32, required
     if alleles is not None:
         out += leb128_u(len(alleles))          # alleles: EArray length
         # Elements are EBinary with no leading '+' in LD_ETYPE -> each element is itself optional,
