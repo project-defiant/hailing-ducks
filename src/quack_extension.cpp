@@ -70,10 +70,9 @@ static void LoadInternal(ExtensionLoader &loader) {
 	HailCodecScanFunction::Register(loader);
 	HailTableScanFunction::Register(loader);
 
-    // Register new LD query / status functions
-    RegisterHailLDQueryFunctions(loader);
+	// Register new LD query / status functions
+	RegisterHailLDQueryFunctions(loader);
 }
-
 
 void QuackExtension::Load(ExtensionLoader &loader) {
 	LoadInternal(loader);

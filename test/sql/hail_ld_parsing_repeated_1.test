@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_parsing_repeated_1.test
+# group: [sql]
+
 require quack
 
 # repeated commas - variant 1

@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_parsing_whitespace_2.test
+# group: [sql]
+
 require quack
 
 # whitespace trimming - variant 2

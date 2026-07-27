@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight_outside.test
+# group: [sql]
+
 require quack
 
 # Outside-locus detection: variants outside supplied interval should be code 3

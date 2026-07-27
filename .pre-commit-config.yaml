@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: duckdb-format
+        name: Format C++/SQLLogicTest sources (clang-format, black, cmake-format)
+        entry: env DUCKDB_FORMAT_SKIP_VERSION_CHECKS=1 uv run make format-fix
+        language: system
+        pass_filenames: false
+        files: ^(src/|test/sql/|CMakeLists\.txt$)

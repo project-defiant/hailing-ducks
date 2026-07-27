@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_parse_token.test
+# group: [sql]
+
 require quack
 
 # Scalar parse helper test

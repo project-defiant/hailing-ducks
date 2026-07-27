@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight_chunking.test
+# group: [sql]
+
 require quack
 
 # Chunking tests with CHUNK_SIZE=16 (in-extension test override)

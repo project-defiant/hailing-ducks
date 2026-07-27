@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight_edgecases.test
+# group: [sql]
+
 require quack
 
 # Edge cases for hail_ld_preflight

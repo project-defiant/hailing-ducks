@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight_multibase.test
+# group: [sql]
+
 require quack
 
 # Multi-base allele / indel / 'N' handling

@@ -1,3 +1,6 @@
+# name: test/sql/hail_ld_preflight_flipped.test
+# group: [sql]
+
 require quack
 
 # Flipped-allele resolution TDD
