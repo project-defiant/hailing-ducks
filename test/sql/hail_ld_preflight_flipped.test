@@ -3,11 +3,13 @@
 
 require quack
 
-# Flipped-allele resolution TDD
+# Two distinct requested IDs at the same position (even if they're ref/alt flips of each other) are
+# a request-level conflict at preflight time: multiple_variants_at_position (6). Real exact/flipped
+# resolution happens later, against actual HT rows (hail_ld_resolve_ht), not between sibling requests.
 query II
 SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusF|chr1:1-1000| chr1_300_A_G, chr1_300_G_A, chr1_301_C_T')
 ORDER BY requested_variant_id;
 ----
-chr1_300_A_G	0
-chr1_300_G_A	1
+chr1_300_A_G	6
+chr1_300_G_A	6
 chr1_301_C_T	0

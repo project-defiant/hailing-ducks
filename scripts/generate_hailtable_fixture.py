@@ -36,6 +36,7 @@ BAD_CODEC_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_bad_codec.ht"
 OPTIONAL_ARRAY_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_optional_array.ht"
 ALT_ROWS_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_alt_rows.ht"
 TYPE_MISMATCH_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_type_mismatch.ht"
+LD_FIXTURE_DIR = ROOT / "test" / "hailtable_fixture_ld.ht"
 
 VTYPE = ("Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String],"
          "pop_freq:Struct{AC:Int32,AF:Float64,AN:Int32,homozygote_count:Int32}}")
@@ -313,6 +314,119 @@ def write_optional_array_fixture(fixture_dir: Path, codec: str):
         f.write(json.dumps(top_metadata).encode("utf-8"))
 
 
+# ---------------------------------------------------------------------------
+# Keyed, multi-partition fixture with _key/_jRangeBounds, for the LD query
+# batch HT resolver (issue #18). Schema/key shape verified against a real
+# s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht/rows/metadata.json.gz:
+# _key = ["locus", "alleles"]; _jRangeBounds is one entry per partition, each
+# {"start": {"locus": {...}, "alleles": [...]}, "end": {...}, "includeStart",
+# "includeEnd"}. `alleles` is an OPTIONAL top-level field on real tables (no
+# leading '+' in the real _eType), so this fixture also includes one row with
+# a NULL allele list to exercise that path.
+# ---------------------------------------------------------------------------
+
+LD_VTYPE = "Struct{idx:Int64,locus:Locus(GRCh38),alleles:Array[String]}"
+LD_ETYPE = "+EBaseStruct{idx:+EInt64,locus:+EBaseStruct{contig:+EBinary,position:+EInt32},alleles:EArray[EBinary]}"
+
+# Three partitions: two spanning distinct chr1 sub-ranges (to test position-based pruning within a
+# contig) and one on chr2 (to test contig-based pruning). Row contents cover: an exact match, a
+# flipped match, a multi-allelic row colliding with a request (must NOT be coerced into a match), a
+# row with no matching request (not_found_in_ht), two same-position rows that both match one request
+# in opposite orientations (ambiguous_in_ht), and a NULL-alleles row (must be skipped, not crash).
+LD_PARTITIONS = [
+    [
+        {"idx": 0, "locus": ("chr1", 150), "alleles": None},
+        {"idx": 1, "locus": ("chr1", 200), "alleles": ["A", "G"]},
+        {"idx": 2, "locus": ("chr1", 300), "alleles": ["G", "A"]},
+        {"idx": 3, "locus": ("chr1", 400), "alleles": ["A", "G", "T"]},
+    ],
+    [
+        {"idx": 4, "locus": ("chr1", 700), "alleles": ["C", "T"]},
+        {"idx": 5, "locus": ("chr1", 800), "alleles": ["A", "C"]},
+        {"idx": 6, "locus": ("chr1", 800), "alleles": ["C", "A"]},
+    ],
+    [
+        {"idx": 7, "locus": ("chr2", 200), "alleles": ["A", "G"]},
+    ],
+]
+
+
+def encode_ld_row(row: dict) -> bytes:
+    # Row struct has exactly 1 optional field (alleles, no leading '+' in LD_ETYPE) -> a 1-byte
+    # missing-bit prefix, read/written before any field (same rule as encode_optional_row above).
+    alleles = row["alleles"]
+    missing_byte = 0b1 if alleles is None else 0b0
+    out = bytearray()
+    out += bytes([missing_byte])
+    out += leb128_u(row["idx"])              # idx: EInt64, required
+    contig, position = row["locus"]
+    out += encode_string(contig)              # locus.contig: EBinary, required
+    out += leb128_u(position)                  # locus.position: EInt32, required
+    if alleles is not None:
+        out += leb128_u(len(alleles))          # alleles: EArray length
+        # Elements are EBinary with no leading '+' in LD_ETYPE -> each element is itself optional,
+        # so the wire format needs a ceil(len/8)-byte missing-bit prefix here too (all zero: none of
+        # our synthetic alleles are ever null), matching DecodeValue's EKind::Array handling.
+        out += bytes((len(alleles) + 7) // 8)
+        for a in alleles:
+            out += encode_string(a)
+    return bytes(out)
+
+
+def _ld_range_bound(contig_lo, pos_lo, contig_hi, pos_hi):
+    return {
+        "start": {"locus": {"contig": contig_lo, "position": pos_lo}, "alleles": []},
+        "end": {"locus": {"contig": contig_hi, "position": pos_hi}, "alleles": []},
+        "includeStart": True,
+        "includeEnd": True,
+    }
+
+
+def write_ld_fixture(fixture_dir: Path, codec: str = "zstd"):
+    parts_dir = fixture_dir / "rows" / "parts"
+    parts_dir.mkdir(parents=True, exist_ok=True)
+
+    part_files = []
+    for i, rows in enumerate(LD_PARTITIONS):
+        part_bytes = build_part_file(rows, codec, encode_fn=encode_ld_row)
+        fname = f"part-{i:05d}"
+        (parts_dir / fname).write_bytes(part_bytes)
+        part_files.append(fname)
+
+    j_range_bounds = [
+        _ld_range_bound("chr1", 150, "chr1", 400),
+        _ld_range_bound("chr1", 700, "chr1", 800),
+        _ld_range_bound("chr2", 200, "chr2", 200),
+    ]
+
+    rows_metadata = {
+        "_key": ["locus", "alleles"],
+        "_codecSpec": {
+            "_eType": LD_ETYPE,
+            "_vType": LD_VTYPE,
+            "_bufferSpec": buffer_spec_chain(codec),
+        },
+        "_partFiles": part_files,
+        "_jRangeBounds": j_range_bounds,
+    }
+    with gzip.open(fixture_dir / "rows" / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(rows_metadata).encode("utf-8"))
+
+    top_metadata = {
+        "file_version": 1,
+        "table_type": f"Table{{global:Struct{{}},key:[locus,alleles],row:{LD_VTYPE}}}",
+        "components": {
+            "rows": {"name": "RVDComponentSpec", "rel_path": "rows"},
+            "partition_counts": {
+                "name": "PartitionCountsComponentSpec",
+                "counts": [len(p) for p in LD_PARTITIONS],
+            },
+        },
+    }
+    with gzip.open(fixture_dir / "metadata.json.gz", "wb") as f:
+        f.write(json.dumps(top_metadata).encode("utf-8"))
+
+
 def write_fixture(fixture_dir: Path, codec: str, rows_rel_path: str = "rows"):
     rows_dir = fixture_dir / rows_rel_path
     parts_dir = rows_dir / "parts"
@@ -433,3 +547,5 @@ if __name__ == "__main__":
     print("Wrote", ALT_ROWS_FIXTURE_DIR)
     write_type_mismatch_fixture(TYPE_MISMATCH_FIXTURE_DIR)
     print("Wrote", TYPE_MISMATCH_FIXTURE_DIR)
+    write_ld_fixture(LD_FIXTURE_DIR)
+    print("Wrote", LD_FIXTURE_DIR)

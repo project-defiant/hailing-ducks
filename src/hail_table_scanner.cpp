@@ -93,6 +93,24 @@ static std::string ResolveCompressionCodecName(const json &buffer_spec) {
 	}
 }
 
+// Parses one _jRangeBounds entry. Real Hail range bounds key their "start"/"end" objects by field
+// name from the table's own _key (e.g. {"locus": {...}, "alleles": [...]} for a PanUKBB-style
+// locus+alleles key) -- verified against a real
+// s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht/rows/metadata.json.gz. Only the
+// "locus" sub-object's contig/position is needed for partition pruning.
+static HailTablePartitionBound ParseRangeBound(const json &bound) {
+	HailTablePartitionBound b;
+	auto &start = bound.at("start").at("locus");
+	auto &end = bound.at("end").at("locus");
+	b.start_contig = start.at("contig").get<std::string>();
+	b.start_position = start.at("position").get<int64_t>();
+	b.end_contig = end.at("contig").get<std::string>();
+	b.end_position = end.at("position").get<int64_t>();
+	b.include_start = bound.at("includeStart").get<bool>();
+	b.include_end = bound.at("includeEnd").get<bool>();
+	return b;
+}
+
 static void ValidateTypeCompatibility(const VTypeNode &vtype, const ETypeNode &etype, const std::string &path) {
 	auto incompatible = [&]() {
 		throw BinderException("Incompatible HailTable type metadata at " + path + ": VType " + vtype_to_string(vtype) +
@@ -300,6 +318,76 @@ struct HailTableLocalState : public LocalTableFunctionState {
 };
 
 // ---------------------------------------------------------------------------
+// Metadata loading (shared with the LD query batch HT resolver)
+// ---------------------------------------------------------------------------
+
+HailTableMetadata LoadHailTableMetadata(FileSystem &fs, const std::string &path) {
+	HailTableMetadata result;
+
+	std::string table_meta_path = path + "/metadata.json.gz";
+	json table_meta = ReadGzipJson(fs, table_meta_path);
+	result.rows_rel_path = table_meta.at("components").at("rows").at("rel_path").get<std::string>();
+	if (!IsSafeRelativePath(result.rows_rel_path)) {
+		throw BinderException("Invalid HailTable rows component path in metadata: " + result.rows_rel_path);
+	}
+
+	result.meta_path = path + "/" + result.rows_rel_path + "/metadata.json.gz";
+	json meta = ReadGzipJson(fs, result.meta_path);
+
+	// NOTE: schema lives at the ROOT of rows/metadata.json.gz under "_codecSpec" --
+	// there is no "rg"/"_RVDType" wrapper (that shape does not exist in real Hail
+	// output; verified against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht/).
+	auto &codec_spec = meta.at("_codecSpec");
+	std::string etype_str = codec_spec.at("_eType").get<std::string>();
+	std::string vtype_str = codec_spec.at("_vType").get<std::string>();
+	result.buffer_spec_name = ResolveCompressionCodecName(codec_spec.at("_bufferSpec"));
+
+	try {
+		result.etype = parse_etype(etype_str);
+		result.vtype = parse_vtype(vtype_str);
+	} catch (const std::exception &e) {
+		throw BinderException("Failed to parse HailTable type strings at " + result.meta_path + ": " + e.what());
+	}
+
+	for (auto &pf : meta.at("_partFiles")) {
+		std::string filename = pf.get<std::string>();
+		if (filename.find("..") != std::string::npos || filename.find('/') != std::string::npos ||
+		    filename.find('\\') != std::string::npos) {
+			throw BinderException("Invalid partition filename in metadata (path traversal detected): " + filename);
+		}
+		result.part_files.push_back(std::move(filename));
+	}
+
+	// _key/_jRangeBounds are absent for unkeyed tables (real Hail output confirmed to include them
+	// for keyed, partitioned tables like PanUKBB's LD-adjacent variant HT; the toy fixtures used
+	// elsewhere in this repo are unkeyed and simply won't have pruning available).
+	if (meta.contains("_key")) {
+		for (auto &k : meta.at("_key")) {
+			result.key_fields.push_back(k.get<std::string>());
+		}
+	}
+	if (meta.contains("_jRangeBounds")) {
+		bool all_have_locus = true;
+		std::vector<HailTablePartitionBound> bounds;
+		for (auto &bound : meta.at("_jRangeBounds")) {
+			if (!bound.contains("start") || !bound.at("start").contains("locus") || !bound.contains("end") ||
+			    !bound.at("end").contains("locus")) {
+				all_have_locus = false;
+				break;
+			}
+			bounds.push_back(ParseRangeBound(bound));
+		}
+		// Only a key that includes "locus" is useful for this repo's contig/position pruning; if the
+		// table's key doesn't have one, leave range_bounds empty rather than parsing partial bounds.
+		if (all_have_locus) {
+			result.range_bounds = std::move(bounds);
+		}
+	}
+
+	return result;
+}
+
+// ---------------------------------------------------------------------------
 // Bind
 // ---------------------------------------------------------------------------
 
@@ -309,50 +397,21 @@ static unique_ptr<FunctionData> HailTableBind(ClientContext &context, TableFunct
 	bind_data->path = input.inputs[0].GetValue<string>();
 
 	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadHailTableMetadata(fs, bind_data->path);
+	bind_data->rows_rel_path = metadata.rows_rel_path;
+	bind_data->etype = metadata.etype;
+	bind_data->buffer_spec_name = metadata.buffer_spec_name;
+	bind_data->part_files = metadata.part_files;
 
-	std::string table_meta_path = bind_data->path + "/metadata.json.gz";
-	json table_meta = ReadGzipJson(fs, table_meta_path);
-	bind_data->rows_rel_path = table_meta.at("components").at("rows").at("rel_path").get<std::string>();
-	if (!IsSafeRelativePath(bind_data->rows_rel_path)) {
-		throw BinderException("Invalid HailTable rows component path in metadata: " + bind_data->rows_rel_path);
-	}
-
-	std::string meta_path = bind_data->path + "/" + bind_data->rows_rel_path + "/metadata.json.gz";
-	json meta = ReadGzipJson(fs, meta_path);
-
-	// NOTE: schema lives at the ROOT of rows/metadata.json.gz under "_codecSpec" --
-	// there is no "rg"/"_RVDType" wrapper (that shape does not exist in real Hail
-	// output; verified against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht/).
-	auto &codec_spec = meta.at("_codecSpec");
-	std::string etype_str = codec_spec.at("_eType").get<std::string>();
-	std::string vtype_str = codec_spec.at("_vType").get<std::string>();
-	bind_data->buffer_spec_name = ResolveCompressionCodecName(codec_spec.at("_bufferSpec"));
-
-	VTypeNode vtype;
-	try {
-		bind_data->etype = parse_etype(etype_str);
-		vtype = parse_vtype(vtype_str);
-	} catch (const std::exception &e) {
-		throw BinderException("Failed to parse HailTable type strings at " + meta_path + ": " + e.what());
-	}
-
+	auto &vtype = metadata.vtype;
 	if (vtype.kind != VKind::Struct || bind_data->etype.kind != EKind::BaseStruct) {
-		throw BinderException("HailTable row type must be a Struct at " + meta_path);
+		throw BinderException("HailTable row type must be a Struct at " + metadata.meta_path);
 	}
-	ValidateTypeCompatibility(vtype, bind_data->etype, meta_path);
+	ValidateTypeCompatibility(vtype, bind_data->etype, metadata.meta_path);
 
 	for (auto &field : vtype.children) {
 		names.push_back(field.name);
 		return_types.push_back(VTypeToDuckDBType(field));
-	}
-
-	for (auto &pf : meta.at("_partFiles")) {
-		std::string filename = pf.get<std::string>();
-		if (filename.find("..") != std::string::npos || filename.find('/') != std::string::npos ||
-		    filename.find('\\') != std::string::npos) {
-			throw BinderException("Invalid partition filename in metadata (path traversal detected): " + filename);
-		}
-		bind_data->part_files.push_back(std::move(filename));
 	}
 
 	return std::move(bind_data);
@@ -369,6 +428,51 @@ static unique_ptr<LocalTableFunctionState> HailTableInitLocal(ExecutionContext &
 }
 
 // ---------------------------------------------------------------------------
+// Per-row decode (shared with the LD query batch HT resolver)
+// ---------------------------------------------------------------------------
+
+// Every row is prefixed by a 1-byte continuation flag: nonzero means "a row follows," 0x00 means
+// "end of partition." This is a real Hail wire-protocol detail (verified by manually decoding a real
+// Pan-UKBB partition) that is NOT part of the row struct's own missing-bit encoding -- read it before
+// the struct's own optional-field missing-bit prefix (computed fresh per call since it's cheap
+// relative to the decode work and keeps this function self-contained for callers other than the
+// per-partition scan loop below).
+bool DecodeHailTableRow(BlockDecoder &decoder, const ETypeNode &etype, DataChunk &output, idx_t row) {
+	uint8_t continue_flag = decoder.read_byte();
+	if (continue_flag == 0) {
+		return false;
+	}
+
+	int n_optional_fields = 0;
+	for (auto &f : etype.children) {
+		if (!f.required) {
+			n_optional_fields++;
+		}
+	}
+	size_t n_missing_bytes = (static_cast<size_t>(n_optional_fields) + 7) / 8;
+	std::vector<uint8_t> missing_bits(n_missing_bytes);
+	if (n_missing_bytes > 0) {
+		decoder.read_bytes(missing_bits.data(), n_missing_bytes);
+	}
+
+	int optional_idx = 0;
+	for (idx_t col = 0; col < etype.children.size(); col++) {
+		const auto &field = etype.children[col];
+		bool is_null = false;
+		if (!field.required) {
+			is_null = (missing_bits[optional_idx / 8] >> (optional_idx % 8)) & 1;
+			optional_idx++;
+		}
+		if (is_null) {
+			FlatVector::SetNull(output.data[col], row, true);
+		} else {
+			DecodeValue(field, decoder, output.data[col], row);
+		}
+	}
+	return true;
+}
+
+// ---------------------------------------------------------------------------
 // Scan
 // ---------------------------------------------------------------------------
 
@@ -379,21 +483,6 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 
 	idx_t out_row = 0;
 	const idx_t capacity = STANDARD_VECTOR_SIZE;
-
-	// The row struct (bind_data.etype) is structurally just a BaseStruct like any
-	// nested one -- if it has optional top-level fields, Hail's wire format
-	// requires a ceil(n_optional/8)-byte missing-bit prefix to be read and
-	// consulted before decoding the fields, just like DecodeValue does for
-	// nested structs. Compute this once (bind_data.etype doesn't change across
-	// rows) and reuse the scratch buffer per row.
-	int n_optional_fields = 0;
-	for (auto &f : bind_data.etype.children) {
-		if (!f.required) {
-			n_optional_fields++;
-		}
-	}
-	size_t n_missing_bytes = (static_cast<size_t>(n_optional_fields) + 7) / 8;
-	std::vector<uint8_t> missing_bits(n_missing_bytes);
 
 	while (out_row < capacity) {
 		if (!local_state.HasPartition() || local_state.Done()) {
@@ -411,32 +500,9 @@ static void HailTableScan(ClientContext &context, TableFunctionInput &data, Data
 		}
 
 		while (out_row < capacity && !local_state.partition_done) {
-			// Every row is prefixed by a 1-byte continuation flag: nonzero means
-			// "a row follows," 0x00 means "end of partition." This is a real Hail
-			// wire-protocol detail (verified by manually decoding a real Pan-UKBB
-			// partition) that is NOT part of the row struct's own missing-bit
-			// encoding -- keep it in the top-level row scan loop.
-			uint8_t continue_flag = local_state.decoder->read_byte();
-			if (continue_flag == 0) {
+			if (!DecodeHailTableRow(*local_state.decoder, bind_data.etype, output, out_row)) {
 				local_state.partition_done = true;
 				break;
-			}
-			if (n_missing_bytes > 0) {
-				local_state.decoder->read_bytes(missing_bits.data(), n_missing_bytes);
-			}
-			int optional_idx = 0;
-			for (idx_t col = 0; col < output.ColumnCount(); col++) {
-				const auto &field = bind_data.etype.children[col];
-				bool is_null = false;
-				if (!field.required) {
-					is_null = (missing_bits[optional_idx / 8] >> (optional_idx % 8)) & 1;
-					optional_idx++;
-				}
-				if (is_null) {
-					FlatVector::SetNull(output.data[col], out_row, true);
-				} else {
-					DecodeValue(field, *local_state.decoder, output.data[col], out_row);
-				}
 			}
 			out_row++;
 		}

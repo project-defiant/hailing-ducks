@@ -1,10 +1,13 @@
 #include "hail_ld_query.hpp"
+#include "hail_table_scanner.hpp"
+#include "hail_codec.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/constants.hpp"
+#include "duckdb/common/file_system.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdio>
@@ -12,6 +15,7 @@
 #include <vector>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
 #include <regex>
 
 namespace duckdb {
@@ -83,6 +87,23 @@ struct PreflightOutRow {
 	int32_t code;
 };
 
+// A variant that passed all preflight structural checks (well-formed, in-locus, sole allele pair at
+// its position) and is a candidate for real HailTable resolution (see ClassifyLocusVariants below).
+struct LocusCandidate {
+	std::string token;
+	std::string contig;
+	int64_t pos;
+	std::string ref;
+	std::string alt;
+};
+
+// The parsed (contig, start, end) of a locus_range string, as consumed by outside-locus filtering.
+struct LocusInterval {
+	std::string contig;
+	int64_t start = 0;
+	int64_t end = 0;
+};
+
 struct PreflightBindData : public TableFunctionData {
 	std::string request_arg;
 };
@@ -110,31 +131,27 @@ struct PreflightLocalState : public LocalTableFunctionState {
 	idx_t next = 0;
 };
 
-// Shared per-locus classification: parses raw variant tokens against a locus range and appends
-// variant-status events (dedupe, outside_locus, ambiguous/flipped allele grouping) to `rows`.
-// Used by both the single-locus inline function and the multi-locus request-file function.
-static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
-                                  const std::vector<std::string> &raw_tokens, std::vector<PreflightOutRow> &rows) {
-	// parse locus_range -> contig:start-end; a malformed range is a structural error, not something
-	// to silently ignore (silently skipping outside-locus filtering would let out-of-range variants
-	// through undetected).
-	string locus_contig;
-	int64_t locus_start = 0, locus_end = 0;
+// Parses a "<contig>:<start>-<end>" locus range string. A malformed range is a structural error,
+// not something to silently ignore (silently skipping outside-locus filtering would let out-of-range
+// variants through undetected). Shared by ClassifyLocusVariants and the HT partition-pruning path.
+static LocusInterval ParseLocusRangeOrThrow(const std::string &locus_range, const std::string &locus_id,
+                                            const std::string &caller_name) {
+	LocusInterval interval;
 	bool malformed = true;
 	if (!locus_range.empty()) {
 		// expect e.g. chr1:100-200
 		auto colon = locus_range.find(':');
 		if (colon != string::npos) {
-			locus_contig = locus_range.substr(0, colon);
+			interval.contig = locus_range.substr(0, colon);
 			string rest = locus_range.substr(colon + 1);
 			auto dash = rest.find('-');
 			if (dash != string::npos) {
 				string sstart = rest.substr(0, dash);
 				string send = rest.substr(dash + 1);
 				try {
-					locus_start = stoll(sstart);
-					locus_end = stoll(send);
-					malformed = !(locus_start <= locus_end);
+					interval.start = stoll(sstart);
+					interval.end = stoll(send);
+					malformed = !(interval.start <= interval.end);
 				} catch (...) {
 					malformed = true;
 				}
@@ -142,10 +159,25 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 		}
 	}
 	if (malformed) {
-		throw BinderException("hail_ld_preflight: malformed locus range '%s' for locus_id '%s' (expected "
+		throw BinderException("%s: malformed locus range '%s' for locus_id '%s' (expected "
 		                      "'<contig>:<start>-<end>' with start <= end)",
-		                      locus_range, locus_id);
+		                      caller_name, locus_range, locus_id);
 	}
+	return interval;
+}
+
+// Shared per-locus classification: parses raw variant tokens against a locus range and appends
+// variant-status events (dedupe, outside_locus, ambiguous/flipped allele grouping) to `rows`.
+// Variants that pass every structural check are also appended to `candidates` (still without a
+// terminal status row) for callers that go on to do real HailTable resolution; `interval` receives
+// the parsed locus range. Used by the single-locus inline function, the multi-locus request-file
+// function, and (via candidates/interval) the HT resolver.
+static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
+                                  const std::vector<std::string> &raw_tokens, std::vector<PreflightOutRow> &rows,
+                                  std::vector<LocusCandidate> &candidates, LocusInterval &interval) {
+	interval = ParseLocusRangeOrThrow(locus_range, locus_id, "hail_ld_preflight");
+	const string &locus_contig = interval.contig;
+	int64_t locus_start = interval.start, locus_end = interval.end;
 	const bool locus_ok = true;
 
 	// temp parsed list preserves order
@@ -260,68 +292,143 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 			auto &p = parsed_list[idx];
 			allele_pairs.insert(p.ref + ":" + p.alt);
 		}
-		if (allele_pairs.size() > 2) {
-			// request-level conflict (>2 distinct allele pairs at the same contig/position): exclude
-			// from LD planning before any HT work. Code 4 (ambiguous_in_ht) is reserved for ambiguity
-			// discovered later, during HT resolution.
+		if (allele_pairs.size() > 1) {
+			// request-level conflict (2+ distinct allele pairs at the same contig/position, whether or
+			// not they're ref/alt flips of each other): exclude ALL of them from LD planning before any
+			// HT work. Real exact/flipped resolution is the HT resolver's job (against actual HT rows),
+			// not a preflight-time comparison between sibling requested IDs. Code 4 (ambiguous_in_ht) is
+			// reserved for ambiguity discovered later, during HT resolution.
 			for (auto idx : indices) {
 				rows.push_back({locus_id, parsed_list[idx].token, 6});
 			}
 			continue;
 		}
-		if (allele_pairs.size() == 1) {
-			// single allele pair -> first encountered marked resolved_exact
-			// preserve input order: emit rows for indices in order, first 0, others 0 as duplicates handled earlier
-			for (auto idx : indices) {
-				rows.push_back({locus_id, parsed_list[idx].token, 0});
-			}
-			continue;
-		}
-		// allele_pairs.size() == 2
-		// check if the two pairs are flips of each other
-		auto it = allele_pairs.begin();
-		string a1 = *it;
-		++it;
-		string a2 = *it;
-		auto split_pair = [&](const string &s) -> pair<string, string> {
-			auto pos = s.find(':');
-			return {s.substr(0, pos), s.substr(pos + 1)};
-		};
-		auto pa1 = split_pair(a1);
-		auto pa2 = split_pair(a2);
-		bool is_flip = (pa1.first == pa2.second && pa1.second == pa2.first);
-		if (is_flip) {
-			// find first occurrence among indices; mark first as resolved_exact, others as resolved_flipped if they are
-			// flipped relative to first determine which allele pair was seen first
-			string first_pair = "";
-			string first_token_pair = "";
-			for (auto idx : indices) {
-				auto &p = parsed_list[idx];
-				string pair = p.ref + ":" + p.alt;
-				if (first_pair.empty()) {
-					first_pair = pair;
-					first_token_pair = pair;
-					break;
-				}
-			}
-			// emit: for each in indices, if pair==first_pair -> 0 else -> 1
-			for (auto idx : indices) {
-				auto &p = parsed_list[idx];
-				string pair = p.ref + ":" + p.alt;
-				if (pair == first_pair)
-					rows.push_back({locus_id, p.token, 0});
-				else
-					rows.push_back({locus_id, p.token, 1});
-			}
-		} else {
-			// two distinct non-flip allele pairs at the same position -> request-level conflict:
-			// exclude ALL of them from LD planning (multiple_variants_at_position, 6), not just the
-			// later-encountered ones, since none can be trusted as the single intended variant.
-			for (auto idx : indices) {
-				rows.push_back({locus_id, parsed_list[idx].token, 6});
-			}
+		// single allele pair -> candidate for real HT resolution; preflight only marks it as
+		// structurally clean (placeholder 0), not yet confirmed against HT.
+		for (auto idx : indices) {
+			auto &p = parsed_list[idx];
+			rows.push_back({locus_id, p.token, 0});
+			candidates.push_back({p.token, p.contig, stoll(p.pos), p.ref, p.alt});
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// HT partition pruning
+// ---------------------------------------------------------------------------
+
+// Returns the contiguous [lo, hi) band of partition indices whose range could contain rows of
+// `contig`, using only the table's own recorded partition boundaries -- never a hardcoded reference
+// contig order. Hail's real contig ordering is NOT lexical (confirmed against a real PanUKBB HT
+// whose last partition's bound spans chr7_KI270803v1_alt -> chr19_KI270938v1_alt), so contig name
+// comparisons here are opaque equality checks only. Because partitions are contiguous and
+// non-overlapping in the table's true sort order, every partition touching a given contig forms one
+// contiguous index range -- found by collecting every partition whose start OR end bound names that
+// contig and taking the min/max of that set. Returns {0, 0} if the contig never appears.
+static std::pair<idx_t, idx_t> FindPartitionRangeForContig(const std::vector<HailTablePartitionBound> &bounds,
+                                                           const std::string &contig) {
+	idx_t lo = bounds.size();
+	idx_t hi = 0;
+	for (idx_t i = 0; i < bounds.size(); ++i) {
+		if (bounds[i].start_contig == contig || bounds[i].end_contig == contig) {
+			lo = std::min(lo, i);
+			hi = std::max(hi, i + 1);
+		}
+	}
+	if (lo >= hi) {
+		return {0, 0};
+	}
+	return {lo, hi};
+}
+
+// Whether a single partition's bound could contain a row in [qstart, qend] on `contig`. Only prunes
+// by position when the partition's start and end share `contig` (a pure single-contig partition);
+// a partition that straddles a contig boundary is always kept, since deciding which sub-range of it
+// belongs to `contig` would require a full reference contig-order table -- safe (never wrongly
+// pruned), just not maximally pruned.
+static bool PartitionCouldContainPosition(const HailTablePartitionBound &b, const std::string &contig, int64_t qstart,
+                                          int64_t qend) {
+	if (b.start_contig != contig || b.end_contig != contig) {
+		return true;
+	}
+	int64_t effective_start = b.include_start ? b.start_position : b.start_position + 1;
+	int64_t effective_end = b.include_end ? b.end_position : b.end_position - 1;
+	return effective_start <= qend && effective_end >= qstart;
+}
+
+// Selects the partition indices that could contain rows for the given locus interval. Callers must
+// check `bounds.empty()` themselves first: an empty `bounds` means no partitioner info is available
+// at all (unkeyed table, or no _jRangeBounds), which is "must scan every partition," not "select
+// zero partitions" -- this function only makes sense once real bounds exist.
+static std::vector<idx_t> SelectPartitionsForLocus(const std::vector<HailTablePartitionBound> &bounds,
+                                                   const LocusInterval &interval) {
+	std::vector<idx_t> selected;
+	auto range = FindPartitionRangeForContig(bounds, interval.contig);
+	for (idx_t i = range.first; i < range.second; ++i) {
+		if (PartitionCouldContainPosition(bounds[i], interval.contig, interval.start, interval.end)) {
+			selected.push_back(i);
+		}
+	}
+	return selected;
+}
+
+// hail_ld_ht_partitions_for_locus(ht_path, locus_range) -> partition_idx: a small, directly
+// queryable introspection function proving partition-pruning behavior through observable output
+// (per the PRD's "verify external behavior, not internal structures" testing rule), mirroring the
+// existing hail_ld_preflight_debug precedent.
+struct HTPartitionsBindData : public TableFunctionData {
+	std::vector<idx_t> partitions;
+};
+
+static unique_ptr<FunctionData> HailLDHTPartitionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"partition_idx"};
+	return_types = {LogicalType::INTEGER};
+	auto bind_data = make_uniq<HTPartitionsBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string locus_range = input.inputs[1].GetValue<string>();
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadHailTableMetadata(fs, ht_path);
+	auto interval = ParseLocusRangeOrThrow(locus_range, "n/a", "hail_ld_ht_partitions_for_locus");
+
+	if (metadata.range_bounds.empty()) {
+		for (idx_t i = 0; i < metadata.part_files.size(); ++i) {
+			bind_data->partitions.push_back(i);
+		}
+	} else {
+		bind_data->partitions = SelectPartitionsForLocus(metadata.range_bounds, interval);
+	}
+	return std::move(bind_data);
+}
+
+struct HTPartitionsLocalState : public LocalTableFunctionState {
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDHTPartitionsInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	return make_uniq<HTPartitionsLocalState>();
+}
+
+static void HailLDHTPartitionsScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<HTPartitionsBindData>();
+	auto &local = data.local_state->Cast<HTPartitionsLocalState>();
+	if (local.next >= bind_data.partitions.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, bind_data.partitions.size() - local.next);
+	auto &out_vec = output.data[0];
+	for (idx_t i = 0; i < to_emit; ++i) {
+		FlatVector::GetData<int32_t>(out_vec)[i] = static_cast<int32_t>(bind_data.partitions[local.next + i]);
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
 }
 
 static unique_ptr<LocalTableFunctionState>
@@ -344,7 +451,9 @@ HailLDPreflightInitLocal(ExecutionContext &context, TableFunctionInitInput &inpu
 	std::string varlist = parts[2];
 	auto raw_tokens = StringUtil::Split(varlist, ",");
 
-	ClassifyLocusVariants(locus_id, locus_range, raw_tokens, state->rows);
+	std::vector<LocusCandidate> unused_candidates;
+	LocusInterval unused_interval;
+	ClassifyLocusVariants(locus_id, locus_range, raw_tokens, state->rows, unused_candidates, unused_interval);
 	return std::move(state);
 }
 
@@ -388,6 +497,56 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
 	output.SetCardinality(to_emit);
 }
 
+// One parsed row of a request-file Parquet: (locus_id VARCHAR, locus VARCHAR, variant_ids LIST<VARCHAR>).
+struct LocusRequest {
+	std::string locus_id;
+	std::string locus_range;
+	std::vector<std::string> raw_tokens;
+};
+
+// Reads a request-file Parquet with columns (locus_id VARCHAR, locus VARCHAR, variant_ids
+// LIST<VARCHAR>), one row per fine-mapping locus. Shared by hail_ld_preflight_requests and
+// hail_ld_resolve_ht so the file-reading/NULL-checking logic isn't duplicated between them.
+static std::vector<LocusRequest> ReadLocusRequests(ClientContext &context, const std::string &requests_path,
+                                                   const std::string &caller_name) {
+	std::string escaped_path = StringUtil::Replace(requests_path, "'", "''");
+
+	Connection con(*context.db);
+	auto result = con.Query("SELECT locus_id, locus, variant_ids FROM read_parquet('" + escaped_path + "')");
+	if (result->HasError()) {
+		throw BinderException("%s: failed to read request file '%s': %s", caller_name, requests_path,
+		                      result->GetError());
+	}
+	std::vector<LocusRequest> requests;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); ++row) {
+			auto locus_id_value = chunk->GetValue(0, row);
+			auto locus_range_value = chunk->GetValue(1, row);
+			auto variant_ids_value = chunk->GetValue(2, row);
+			if (locus_id_value.IsNull() || locus_range_value.IsNull() || variant_ids_value.IsNull()) {
+				throw BinderException(
+				    "%s: request file '%s' row %d has a NULL locus_id/locus/variant_ids column; all three "
+				    "columns are required",
+				    caller_name, requests_path, (int)row);
+			}
+			LocusRequest req;
+			req.locus_id = locus_id_value.GetValue<string>();
+			req.locus_range = locus_range_value.GetValue<string>();
+			for (auto &item : ListValue::GetChildren(variant_ids_value)) {
+				if (item.IsNull()) {
+					throw BinderException(
+					    "%s: request file '%s' locus_id '%s' has a NULL entry in variant_ids; all requested "
+					    "variant IDs must be non-NULL",
+					    caller_name, requests_path, req.locus_id);
+				}
+				req.raw_tokens.push_back(item.GetValue<string>());
+			}
+			requests.push_back(std::move(req));
+		}
+	}
+	return requests;
+}
+
 // Multi-locus request file: reads a Parquet file with columns
 // (locus_id VARCHAR, locus VARCHAR, variant_ids LIST<VARCHAR>), one row per fine-mapping locus,
 // and classifies each locus's variant list the same way hail_ld_preflight does for a single locus.
@@ -404,38 +563,12 @@ static unique_ptr<FunctionData> HailLDPreflightRequestsBind(ClientContext &conte
 		return std::move(bind_data);
 	}
 	std::string requests_path = input.inputs[0].GetValue<string>();
-	std::string escaped_path = StringUtil::Replace(requests_path, "'", "''");
-
-	Connection con(*context.db);
-	auto result = con.Query("SELECT locus_id, locus, variant_ids FROM read_parquet('" + escaped_path + "')");
-	if (result->HasError()) {
-		throw BinderException("hail_ld_preflight_requests: failed to read request file '%s': %s", requests_path,
-		                      result->GetError());
-	}
-	while (auto chunk = result->Fetch()) {
-		for (idx_t row = 0; row < chunk->size(); ++row) {
-			auto locus_id_value = chunk->GetValue(0, row);
-			auto locus_range_value = chunk->GetValue(1, row);
-			auto variant_ids_value = chunk->GetValue(2, row);
-			if (locus_id_value.IsNull() || locus_range_value.IsNull() || variant_ids_value.IsNull()) {
-				throw BinderException(
-				    "hail_ld_preflight_requests: request file '%s' row %d has a NULL locus_id/locus/variant_ids "
-				    "column; all three columns are required",
-				    requests_path, (int)row);
-			}
-			std::string locus_id = locus_id_value.GetValue<string>();
-			std::string locus_range = locus_range_value.GetValue<string>();
-			std::vector<std::string> raw_tokens;
-			for (auto &item : ListValue::GetChildren(variant_ids_value)) {
-				if (item.IsNull()) {
-					throw BinderException("hail_ld_preflight_requests: request file '%s' locus_id '%s' has a NULL "
-					                      "entry in variant_ids; all requested variant IDs must be non-NULL",
-					                      requests_path, locus_id);
-				}
-				raw_tokens.push_back(item.GetValue<string>());
-			}
-			ClassifyLocusVariants(locus_id, locus_range, raw_tokens, bind_data->rows);
-		}
+	auto requests = ReadLocusRequests(context, requests_path, "hail_ld_preflight_requests");
+	for (auto &req : requests) {
+		std::vector<LocusCandidate> unused_candidates;
+		LocusInterval unused_interval;
+		ClassifyLocusVariants(req.locus_id, req.locus_range, req.raw_tokens, bind_data->rows, unused_candidates,
+		                      unused_interval);
 	}
 	return std::move(bind_data);
 }
@@ -446,6 +579,260 @@ HailLDPreflightRequestsInitLocal(ExecutionContext &context, TableFunctionInitInp
 	auto &bind = input.bind_data->Cast<PreflightRequestsBindData>();
 	state->rows = bind.rows;
 	return std::move(state);
+}
+
+// ---------------------------------------------------------------------------
+// hail_ld_resolve_ht(ht_path, requests_path): batch HailTable resolver
+// ---------------------------------------------------------------------------
+
+// One resolved (or terminal-status) variant event: a superset of PreflightOutRow with the extra
+// columns real HT resolution can fill in. Nullable columns are tracked with explicit flags rather
+// than sentinel values, since idx/allele_order have no value that can't legitimately occur.
+struct HTResolveOutRow {
+	std::string locus_id;
+	std::string requested_variant_id;
+	std::string matched_variant_id;
+	bool has_matched_variant_id = false;
+	int64_t idx = 0;
+	bool has_idx = false;
+	int32_t allele_order = 0;
+	bool has_allele_order = false;
+	int32_t status_code = 0;
+};
+
+struct HTResolveBindData : public TableFunctionData {
+	std::vector<HTResolveOutRow> rows;
+};
+
+// One HT-side match found for a candidate: its row idx, the HT's own allele pair (used to
+// reconstruct matched_variant_id, which can differ from requested_variant_id on a flip), and the
+// allele_order sign (1 = exact, -1 = flipped).
+struct HTMatch {
+	int64_t idx;
+	std::string allele0, allele1;
+	int32_t allele_order;
+};
+
+static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
+	         "allele_order", "status_domain",        "status_code"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER};
+	auto bind_data = make_uniq<HTResolveBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string requests_path = input.inputs[1].GetValue<string>();
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadHailTableMetadata(fs, ht_path);
+
+	// Real HT schemas carry many more fields than these three (rsid, AF, liftover metadata, ...);
+	// DecodeHailTableRow decodes the FULL row (skipping past whatever else is there) so the byte
+	// cursor stays correctly synced -- this resolver only reads back the columns it needs, by name.
+	int locus_col = -1, alleles_col = -1, idx_col = -1;
+	for (idx_t i = 0; i < metadata.vtype.children.size(); ++i) {
+		auto &f = metadata.vtype.children[i];
+		if (f.name == "locus" && f.kind == VKind::Locus) {
+			locus_col = static_cast<int>(i);
+		} else if (f.name == "alleles" && f.kind == VKind::Array && !f.children.empty() &&
+		           f.children[0].kind == VKind::String) {
+			alleles_col = static_cast<int>(i);
+		} else if (f.name == "idx" && f.kind == VKind::Int64) {
+			idx_col = static_cast<int>(i);
+		}
+	}
+	if (locus_col < 0 || alleles_col < 0 || idx_col < 0) {
+		throw BinderException(
+		    "hail_ld_resolve_ht: HailTable at '%s' is missing a required 'locus'/'alleles'/'idx' field "
+		    "(found locus=%s, alleles=%s, idx=%s) -- this is a structural precondition for HT resolution, "
+		    "not biological missingness",
+		    ht_path, locus_col >= 0 ? "yes" : "no", alleles_col >= 0 ? "yes" : "no", idx_col >= 0 ? "yes" : "no");
+	}
+
+	vector<LogicalType> row_types;
+	for (auto &f : metadata.vtype.children) {
+		row_types.push_back(VTypeToDuckDBType(f));
+	}
+	DataChunk row_chunk;
+	row_chunk.Initialize(context, row_types, 1);
+
+	auto requests = ReadLocusRequests(context, requests_path, "hail_ld_resolve_ht");
+	for (auto &req : requests) {
+		std::vector<PreflightOutRow> preflight_rows;
+		std::vector<LocusCandidate> candidates;
+		LocusInterval interval;
+		ClassifyLocusVariants(req.locus_id, req.locus_range, req.raw_tokens, preflight_rows, candidates, interval);
+
+		// Terminal preflight statuses (outside_locus/unsupported/multiple_variants_at_position) pass
+		// straight through, never touching HT; the placeholder "0" rows are dropped here since their
+		// corresponding candidate gets its own authoritative status below.
+		for (auto &r : preflight_rows) {
+			if (r.code == 0) {
+				continue;
+			}
+			HTResolveOutRow out;
+			out.locus_id = r.locus_id;
+			out.requested_variant_id = r.req;
+			out.status_code = r.code;
+			bind_data->rows.push_back(std::move(out));
+		}
+		if (candidates.empty()) {
+			continue;
+		}
+
+		std::vector<idx_t> selected_partitions;
+		if (metadata.range_bounds.empty()) {
+			// No partitioner info available (unkeyed table / no _jRangeBounds) -- scan everything.
+			for (idx_t i = 0; i < metadata.part_files.size(); ++i) {
+				selected_partitions.push_back(i);
+			}
+		} else {
+			selected_partitions = SelectPartitionsForLocus(metadata.range_bounds, interval);
+		}
+
+		std::unordered_map<std::string, std::vector<idx_t>> candidates_by_pos;
+		for (idx_t i = 0; i < candidates.size(); ++i) {
+			auto &c = candidates[i];
+			candidates_by_pos[c.contig + ":" + std::to_string(c.pos)].push_back(i);
+		}
+
+		std::vector<std::vector<HTMatch>> matches(candidates.size());
+		for (idx_t part_idx : selected_partitions) {
+			std::string part_path = ht_path + "/" + metadata.rows_rel_path + "/parts/" + metadata.part_files[part_idx];
+			auto handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			auto decoder = make_decoder(metadata.buffer_spec_name, *handle, part_path);
+			while (true) {
+				row_chunk.Reset();
+				if (!DecodeHailTableRow(*decoder, metadata.etype, row_chunk, 0)) {
+					break;
+				}
+				auto alleles_value = row_chunk.GetValue(alleles_col, 0);
+				if (alleles_value.IsNull()) {
+					continue;
+				}
+				auto &allele_children = ListValue::GetChildren(alleles_value);
+				if (allele_children.size() != 2) {
+					// Multi-allelic (or mono-allelic) HT rows are never eligible for biallelic matching.
+					continue;
+				}
+				if (allele_children[0].IsNull() || allele_children[1].IsNull()) {
+					continue;
+				}
+
+				auto locus_value = row_chunk.GetValue(locus_col, 0);
+				auto &locus_children = StructValue::GetChildren(locus_value);
+				std::string row_contig = locus_children[0].GetValue<string>();
+				int64_t row_pos = locus_children[1].GetValue<int32_t>();
+
+				auto pos_it = candidates_by_pos.find(row_contig + ":" + std::to_string(row_pos));
+				if (pos_it == candidates_by_pos.end()) {
+					continue;
+				}
+
+				std::string a0 = allele_children[0].GetValue<string>();
+				std::string a1 = allele_children[1].GetValue<string>();
+				int64_t row_idx = row_chunk.GetValue(idx_col, 0).GetValue<int64_t>();
+
+				for (idx_t cand_idx : pos_it->second) {
+					auto &c = candidates[cand_idx];
+					if (a0 == c.ref && a1 == c.alt) {
+						matches[cand_idx].push_back({row_idx, a0, a1, 1});
+					} else if (a0 == c.alt && a1 == c.ref) {
+						matches[cand_idx].push_back({row_idx, a0, a1, -1});
+					}
+				}
+			}
+		}
+
+		for (idx_t i = 0; i < candidates.size(); ++i) {
+			auto &c = candidates[i];
+			auto &m = matches[i];
+			HTResolveOutRow out;
+			out.locus_id = req.locus_id;
+			out.requested_variant_id = c.token;
+			if (m.empty()) {
+				out.status_code = 2; // not_found_in_ht
+			} else if (m.size() > 1) {
+				out.status_code = 4; // ambiguous_in_ht: HT itself has >1 row matching this candidate
+			} else {
+				out.has_matched_variant_id = true;
+				out.matched_variant_id =
+				    c.contig + "_" + std::to_string(c.pos) + "_" + m[0].allele0 + "_" + m[0].allele1;
+				out.has_idx = true;
+				out.idx = m[0].idx;
+				out.has_allele_order = true;
+				out.allele_order = m[0].allele_order;
+				out.status_code = m[0].allele_order == 1 ? 0 : 1; // resolved_exact / resolved_flipped
+			}
+			bind_data->rows.push_back(std::move(out));
+		}
+	}
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDResolveHTInitGlobal(ClientContext &context,
+                                                                      TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct HTResolveLocalState : public LocalTableFunctionState {
+	std::vector<HTResolveOutRow> rows;
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDResolveHTInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<HTResolveLocalState>();
+	auto &bind = input.bind_data->Cast<HTResolveBindData>();
+	state->rows = bind.rows;
+	return std::move(state);
+}
+
+static void HailLDResolveHTScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<HTResolveLocalState>();
+	if (local.next >= local.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, local.rows.size() - local.next);
+
+	auto &locus_vec = output.data[0];
+	auto &req_vec = output.data[1];
+	auto &matched_vec = output.data[2];
+	auto &idx_vec = output.data[3];
+	auto &allele_order_vec = output.data[4];
+	auto &dom_vec = output.data[5];
+	auto &code_vec = output.data[6];
+
+	for (idx_t i = 0; i < to_emit; ++i) {
+		auto &r = local.rows[local.next + i];
+		FlatVector::GetData<string_t>(locus_vec)[i] = StringVector::AddString(locus_vec, r.locus_id);
+		FlatVector::GetData<string_t>(req_vec)[i] = StringVector::AddString(req_vec, r.requested_variant_id);
+		if (r.has_matched_variant_id) {
+			FlatVector::GetData<string_t>(matched_vec)[i] = StringVector::AddString(matched_vec, r.matched_variant_id);
+		} else {
+			FlatVector::SetNull(matched_vec, i, true);
+		}
+		if (r.has_idx) {
+			FlatVector::GetData<int64_t>(idx_vec)[i] = r.idx;
+		} else {
+			FlatVector::SetNull(idx_vec, i, true);
+		}
+		if (r.has_allele_order) {
+			FlatVector::GetData<int32_t>(allele_order_vec)[i] = r.allele_order;
+		} else {
+			FlatVector::SetNull(allele_order_vec, i, true);
+		}
+		FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "variant");
+		FlatVector::GetData<int32_t>(code_vec)[i] = r.status_code;
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
 }
 
 // Debug table function: emit parsed parts for each token for inspection
@@ -618,6 +1005,18 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 	                            HailLDPreflightRequestsBind, HailLDPreflightInitGlobal,
 	                            HailLDPreflightRequestsInitLocal);
 	loader.RegisterFunction(requests_func);
+
+	// partition-pruning introspection: which HT partitions a locus range would select
+	TableFunction ht_partitions_func("hail_ld_ht_partitions_for_locus", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                 HailLDHTPartitionsScan, HailLDHTPartitionsBind, HailLDPreflightInitGlobal,
+	                                 HailLDHTPartitionsInitLocal);
+	loader.RegisterFunction(ht_partitions_func);
+
+	// batch HailTable resolver: per-locus direct/flipped matching with partition pruning
+	TableFunction resolve_ht_func("hail_ld_resolve_ht", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                              HailLDResolveHTScan, HailLDResolveHTBind, HailLDResolveHTInitGlobal,
+	                              HailLDResolveHTInitLocal);
+	loader.RegisterFunction(resolve_ht_func);
 
 	// debug preflight parser inspection function
 	TableFunction debug_func(
