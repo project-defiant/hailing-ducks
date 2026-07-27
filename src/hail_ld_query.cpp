@@ -365,8 +365,13 @@ static unique_ptr<LocalTableFunctionState> HailLDPreflightInitLocalDebug(Executi
                                                                         TableFunctionInitInput &input,
                                                                         GlobalTableFunctionState *) {
     auto state = make_uniq<DebugLocalState>();
-    auto &bind = input.bind_data->Cast<PreflightBindData>();
-    std::string s = bind.request_arg;
+    std::string s;
+    if (input.bind_data) {
+        auto &bind = input.bind_data->Cast<PreflightBindData>();
+        s = bind.request_arg;
+    } else if (!input.inputs.empty()) {
+        s = input.inputs[0].GetValue<string>();
+    }
     if (s.empty()) return std::move(state);
     auto parts = StringUtil::Split(s, "|");
     if (parts.size() != 3) return std::move(state);
@@ -492,11 +497,16 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 
     // debug preflight parser inspection function
     TableFunction debug_func("hail_ld_preflight_debug", {LogicalType::VARCHAR}, HailLDPreflightDebugScan,
-                             [](ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) -> unique_ptr<FunctionData> {
-                                 names = {"original_token", "stripped_token", "contig", "pos", "ref", "alt", "parse_ok"};
-                                 return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
-                                 return nullptr;
-                             }, nullptr, HailLDPreflightInitLocalDebug);
+        [](ClientContext &context, TableFunctionBindInput &input, vector<LogicalType> &return_types, vector<string> &names) -> unique_ptr<FunctionData> {
+            names = {"original_token", "stripped_token", "contig", "pos", "ref", "alt", "parse_ok"};
+            return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::INTEGER};
+            auto bind_data = make_uniq<PreflightBindData>();
+            if (!input.inputs.empty()) {
+                bind_data->request_arg = input.inputs[0].GetValue<string>();
+            }
+            return std::move(bind_data);
+        },
+        nullptr, HailLDPreflightInitLocalDebug);
     loader.RegisterFunction(debug_func);
     fprintf(stderr, "[hail_ld] registered hail_ld_preflight_debug\n");
 
