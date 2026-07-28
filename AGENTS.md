@@ -2,9 +2,9 @@
 
 ## Project Structure & Module Organization
 
-This repository builds the `quack` DuckDB extension for reading Hail native files without JVM dependencies. Core C++ implementation files live in `src/`, with public/internal declarations in `src/include/`. Extension registration starts in `src/quack_extension.cpp`; Hail BlockMatrix scanning is in `src/hail_blockmatrix_scanner.cpp`; codec helpers are in `src/hail_codec.cpp`.
+This repository builds the `quack` DuckDB extension for reading Hail native files without JVM dependencies. Core C++ implementation files live in `src/`, with public/internal declarations in `src/include/`. Extension registration starts in `src/quack_extension.cpp`; Hail BlockMatrix scanning is in `src/hail_blockmatrix_scanner.cpp`; HailTable scanning is in `src/hail_table_scanner.cpp`; codec helpers are in `src/hail_codec.cpp`. `src/hail_ld_query.cpp` implements a separate, purpose-built batch-optimized LD query pipeline (resolving a fine-mapping locus's requested variants against a real HailTable and extracting exactly the LD pairs among them from a real BlockMatrix) — see `docs/LD-QUERY.md` for the full reference.
 
-Tests and fixtures live under `test/`. SQLLogicTest files are in `test/sql/`, binary codec fixtures are in `test/codec/`, and sample Hail datasets are stored as fixture directories such as `test/matrix.bm/` and `test/variant_indices.ht/`. Build metadata is in `CMakeLists.txt`, `extension_config.cmake`, `vcpkg.json`, and the root `Makefile`.
+Tests and fixtures live under `test/`. SQLLogicTest files are in `test/sql/`, binary codec fixtures are in `test/codec/`, and sample Hail datasets are stored as fixture directories such as `test/matrix.bm/`, `test/variant_indices.ht/`, and the LD-query-specific `test/matrix_ld.bm/`/`test/hailtable_fixture_ld.ht/`. Fixtures are committed binaries generated offline by the scripts in `scripts/` (no Hail dependency needed to regenerate them). Build metadata is in `CMakeLists.txt`, `extension_config.cmake`, `vcpkg.json`, and the root `Makefile`.
 
 ## Build, Test, and Development Commands
 
@@ -15,6 +15,7 @@ Tests and fixtures live under `test/`. SQLLogicTest files are in `test/sql/`, bi
 - `make test`: run the SQLLogicTest suite.
 - `make test_debug`: run tests against a debug build.
 - `make test_http`: start the local HTTP fixture server and run HTTP-backed BlockMatrix tests.
+- `make test_s3_smoke`: opt-in real-S3 LD query smoke test against PanUKBB-style HT/BM paths; skips cleanly unless `HAILING_DUCKS_S3_HT_PATH`/`HAILING_DUCKS_S3_BM_PATH` are set (no AWS credentials needed for the public PanUKBB bucket).
 
 ## Coding Style & Naming Conventions
 
