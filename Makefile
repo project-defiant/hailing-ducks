@@ -35,3 +35,15 @@ test_http: release
 	HTTP_TEST_PORT=18642 ./build/release/$(TEST_PATH) "test/sql/hail_blockmatrix_http.test" || \
 	  { scripts/stop_test_http_server.sh; exit 1; }
 	scripts/stop_test_http_server.sh
+
+# Run the opt-in S3 smoke test against a real, remote PanUKBB-style HailTable + BlockMatrix (issue
+# #22). Requires httpfs and network access; skips cleanly (not a failure) if the path env vars below
+# aren't set, so plain `make test` never depends on network access. No AWS credentials are needed for
+# the public PanUKBB bucket.
+# Usage:
+#   HAILING_DUCKS_S3_HT_PATH=s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht \
+#   HAILING_DUCKS_S3_BM_PATH=s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm \
+#   make test_s3_smoke
+.PHONY: test_s3_smoke
+test_s3_smoke: release
+	./build/release/$(TEST_PATH) --test-dir . "test/sql/hail_ld_s3_smoke.test"

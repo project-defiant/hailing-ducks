@@ -8,3 +8,13 @@ duckdb_extension_load(quack
 
 # Any extra extensions that should be built
 # e.g.: duckdb_extension_load(json)
+
+# httpfs: needed by test/sql/hail_blockmatrix_http.test (make test_http) and
+# test/sql/hail_ld_s3_smoke.test (make test_s3_smoke), both of which `require httpfs`. Pinned to the
+# same GIT_TAG this vendored duckdb submodule itself uses (duckdb/.github/config/extensions/httpfs.cmake).
+# Deliberately no LOAD_TESTS here -- that would pull httpfs's own bundled SQLLogicTest suite into this
+# project's test surface (extra require-json/require-tpch skips this project doesn't need).
+duckdb_extension_load(httpfs
+    GIT_URL https://github.com/duckdb/duckdb-httpfs
+    GIT_TAG 827222fb45a043a7a852d1f7aae46901492a3cda
+)

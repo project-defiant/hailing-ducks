@@ -48,6 +48,10 @@ make test                                              # run the full SQLLogicTe
 ./build/release/test/unittest --test-dir . "test/sql/hail_codec.test"   # run a single test file
 make test_http                                         # HTTP/VFS integration test (starts/stops a
                                                         # local Python HTTP server around the run)
+make test_s3_smoke                                     # opt-in real-S3 LD query smoke test; skips
+                                                        # cleanly unless HAILING_DUCKS_S3_HT_PATH /
+                                                        # HAILING_DUCKS_S3_BM_PATH are set — see
+                                                        # docs/LD-QUERY.md
 ```
 
 Tests are [DuckDB SQLLogicTests](https://duckdb.org/docs/dev/testing) living in `test/sql/*.test`.
@@ -116,6 +120,23 @@ The three registered functions here (`hail_zstd_info`, `hail_leb128_u32`, `hail_
 purely as **testing helpers** for `ZstdBlockDecoder` itself — they are not part of the public HailTable
 scanning API. `hail_scan_table` consumes the shared decoder abstraction directly instead of
 re-deriving frame, LEB128, or LZ4/Zstd logic.
+
+### `hail_ld_query.cpp` — batch-optimized LD query
+
+A separate, purpose-built path (distinct from the raw `hail_scan_table`/`hail_scan_blockmatrix`
+readers above) for resolving a fine-mapping locus's requested variants against a real HailTable and
+extracting exactly the LD pairs among them from a real BlockMatrix, without scanning either file in
+full and without Hail/Spark/a JVM. Pipeline: `hail_ld_preflight_requests` (structural validation) →
+`hail_ld_resolve_ht` (partition-pruned HT resolution, direct + flipped allele matching) →
+`hail_ld_bm_pairs`/`hail_ld_bm_pairs_batch` (canonical-pair BM extraction with a shared,
+capacity-bounded block cache) → `hail_ld_materialize` (one physical HT+BM pass, writes
+`ld_pairs.parquet` + `variant_resolution_status.parquet`). `LoadHailTableMetadata`/
+`DecodeHailTableRow` (from `hail_table_scanner.cpp`) and `LoadBlockMatrixMetadata`/
+`ComputeBlockMatrixBlockInfo`/`DecompressHailLz4Stream` (from `hail_blockmatrix_scanner.cpp`) are
+reused directly rather than re-derived. Full schemas, the status-code table, and the
+no-normalization/no-diagonal-pair policies are documented in `docs/LD-QUERY.md`, including the real
+(and non-obvious — verified against actual PanUKBB S3 data, see git history around commits `2ae8b3c`
+and `5933127`) BlockMatrix storage orientation this path depends on.
 
 ## Updating the DuckDB target version
 
