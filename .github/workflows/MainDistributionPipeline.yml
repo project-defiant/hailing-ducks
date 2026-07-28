@@ -19,6 +19,10 @@ jobs:
       duckdb_version: v1.5.0
       ci_tools_version: v1.5.0
       extension_name: quack
+      # httpfs (loaded in extension_config.cmake for the opt-in test_http/test_s3_smoke targets)
+      # has its own vcpkg.json (curl + openssl) that vcpkg won't resolve automatically unless the
+      # per-extension manifests are merged into the main build's vcpkg manifest.
+      use_merged_vcpkg_manifest: "1"
 
   code-quality-check:
     name: Code Quality Check

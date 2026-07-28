@@ -166,6 +166,16 @@ BlockMatrixMetadata LoadBlockMatrixMetadata(FileSystem &fs, const std::string &p
 		for (auto &idx : *maybe_filtered) {
 			result.block_indices.push_back(idx.get<int32_t>());
 		}
+		// part_files and block_indices must align 1:1 by position (part_files[i] is the physical
+		// file for flat block index block_indices[i]) -- downstream code assumes this everywhere
+		// (the scanner's own block->file lookups and hail_ld_query.cpp's block_idx_to_part_pos map),
+		// so a length mismatch here must be caught now rather than silently misaligning or
+		// out-of-bounds-indexing later.
+		if (result.block_indices.size() != result.part_files.size()) {
+			throw BinderException("BlockMatrix metadata at " + meta_path + " is malformed: 'maybeFiltered' has " +
+			                      std::to_string(result.block_indices.size()) + " entries but 'partFiles' has " +
+			                      std::to_string(result.part_files.size()) + " -- these must have equal length");
+		}
 	} else {
 		// all partitions in order
 		for (int32_t i = 0; i < static_cast<int32_t>(result.part_files.size()); ++i) {

@@ -1499,7 +1499,10 @@ public:
 			}
 			column_defs += KeywordHelper::WriteOptionallyQuoted(column_names[i]) + " " + column_types[i].ToString();
 		}
-		auto create_result = con_.Query("CREATE TEMP TABLE " + table_name_ + "(" + column_defs + ")");
+		// CREATE OR REPLACE: each sink already uses its own fresh Connection (DuckDB scopes TEMP
+		// tables per-connection, so distinct calls don't actually collide), but this is a costless
+		// hardening against any future path that re-binds/reuses a connection.
+		auto create_result = con_.Query("CREATE OR REPLACE TEMP TABLE " + table_name_ + "(" + column_defs + ")");
 		if (create_result->HasError()) {
 			throw IOException("hail_ld_materialize: failed to create staging table '" + table_name_ +
 			                  "': " + create_result->GetError());
