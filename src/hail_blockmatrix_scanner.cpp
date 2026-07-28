@@ -38,7 +38,7 @@ using json = nlohmann::json;
 
 // Decompress a Hail LZ4-blocked stream into a flat byte vector.
 // Uses DuckDB's FileHandle so any VFS backend (local, S3, GCS, HTTP, …) is supported.
-static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const std::string &path_for_errors) {
+std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const std::string &path_for_errors) {
 	// Helper: read exactly n bytes, looping over partial reads (common for HTTP/cloud backends).
 	// Returns false only at a clean EOF at a frame boundary (0 bytes read when expecting frame header).
 	auto read_exact = [&](void *buf, int64_t n) -> bool {
@@ -109,14 +109,8 @@ static std::vector<uint8_t> DecompressHailLz4Stream(FileHandle &handle, const st
 // and computes the global row/col offsets and block dimensions.
 // ---------------------------------------------------------------------------
 
-struct BlockInfo {
-	int64_t global_row_start;
-	int64_t global_col_start;
-	int64_t block_n_rows;
-	int64_t block_n_cols;
-};
-
-static BlockInfo ComputeBlockInfo(int32_t block_idx, int32_t block_size, int64_t n_rows, int64_t n_cols) {
+BlockMatrixBlockInfo ComputeBlockMatrixBlockInfo(int32_t block_idx, int32_t block_size, int64_t n_rows,
+                                                 int64_t n_cols) {
 	int64_t n_block_cols = (n_cols + block_size - 1) / block_size;
 	int64_t block_row = block_idx / n_block_cols;
 	int64_t block_col = block_idx % n_block_cols;
@@ -125,6 +119,71 @@ static BlockInfo ComputeBlockInfo(int32_t block_idx, int32_t block_size, int64_t
 	int64_t block_n_rows = std::min(static_cast<int64_t>(block_size), n_rows - row_start);
 	int64_t block_n_cols = std::min(static_cast<int64_t>(block_size), n_cols - col_start);
 	return {row_start, col_start, block_n_rows, block_n_cols};
+}
+
+// ---------------------------------------------------------------------------
+// Metadata loading (shared with the LD query BM pair-extraction resolver)
+// ---------------------------------------------------------------------------
+
+BlockMatrixMetadata LoadBlockMatrixMetadata(FileSystem &fs, const std::string &path) {
+	BlockMatrixMetadata result;
+
+	std::string meta_path = path + "/metadata.json";
+	unique_ptr<FileHandle> meta_handle;
+	try {
+		meta_handle = fs.OpenFile(meta_path, FileFlags::FILE_FLAGS_READ);
+	} catch (const std::exception &e) {
+		throw BinderException("Cannot open Hail BlockMatrix metadata: " + meta_path + ": " + e.what());
+	}
+	int64_t file_size = fs.GetFileSize(*meta_handle);
+	std::vector<uint8_t> meta_raw(static_cast<size_t>(file_size));
+	meta_handle->Read(meta_raw.data(), static_cast<idx_t>(file_size));
+	json meta;
+	try {
+		meta = json::parse(meta_raw.begin(), meta_raw.end());
+	} catch (const std::exception &e) {
+		throw BinderException("Failed to parse BlockMatrix metadata at " + meta_path + ": " + e.what());
+	}
+
+	result.block_size = meta.at("blockSize").get<int32_t>();
+	if (result.block_size <= 0) {
+		throw BinderException("Invalid blockSize in metadata: must be positive");
+	}
+	result.n_rows = meta.at("nRows").get<int64_t>();
+	result.n_cols = meta.at("nCols").get<int64_t>();
+
+	for (auto &pf : meta.at("partFiles")) {
+		std::string filename = pf.get<std::string>();
+		if (filename.find("..") != std::string::npos || filename.find('/') != std::string::npos ||
+		    filename.find('\\') != std::string::npos) {
+			throw BinderException("Invalid partition filename in metadata (path traversal detected): " + filename);
+		}
+		result.part_files.push_back(std::move(filename));
+	}
+
+	auto maybe_filtered = meta.find("maybeFiltered");
+	if (maybe_filtered != meta.end() && !maybe_filtered->is_null()) {
+		for (auto &idx : *maybe_filtered) {
+			result.block_indices.push_back(idx.get<int32_t>());
+		}
+		// part_files and block_indices must align 1:1 by position (part_files[i] is the physical
+		// file for flat block index block_indices[i]) -- downstream code assumes this everywhere
+		// (the scanner's own block->file lookups and hail_ld_query.cpp's block_idx_to_part_pos map),
+		// so a length mismatch here must be caught now rather than silently misaligning or
+		// out-of-bounds-indexing later.
+		if (result.block_indices.size() != result.part_files.size()) {
+			throw BinderException("BlockMatrix metadata at " + meta_path + " is malformed: 'maybeFiltered' has " +
+			                      std::to_string(result.block_indices.size()) + " entries but 'partFiles' has " +
+			                      std::to_string(result.part_files.size()) + " -- these must have equal length");
+		}
+	} else {
+		// all partitions in order
+		for (int32_t i = 0; i < static_cast<int32_t>(result.part_files.size()); ++i) {
+			result.block_indices.push_back(i);
+		}
+	}
+
+	return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,52 +249,13 @@ static unique_ptr<FunctionData> HailBlockMatrixBind(ClientContext &context, Tabl
 	auto bind_data = make_uniq<HailBlockMatrixBindData>();
 	bind_data->path = input.inputs[0].GetValue<string>();
 
-	// Read metadata.json via DuckDB VFS (supports local paths, s3://, gs://, http://, etc.)
-	std::string meta_path = bind_data->path + "/metadata.json";
 	auto &fs = FileSystem::GetFileSystem(context);
-	unique_ptr<FileHandle> meta_handle;
-	try {
-		meta_handle = fs.OpenFile(meta_path, FileFlags::FILE_FLAGS_READ);
-	} catch (const std::exception &e) {
-		throw BinderException("Cannot open Hail BlockMatrix metadata: " + meta_path + ": " + e.what());
-	}
-	int64_t file_size = fs.GetFileSize(*meta_handle);
-	std::vector<uint8_t> meta_raw(static_cast<size_t>(file_size));
-	meta_handle->Read(meta_raw.data(), static_cast<idx_t>(file_size));
-	json meta;
-	try {
-		meta = json::parse(meta_raw.begin(), meta_raw.end());
-	} catch (const std::exception &e) {
-		throw BinderException("Failed to parse BlockMatrix metadata at " + meta_path + ": " + e.what());
-	}
-
-	bind_data->block_size = meta.at("blockSize").get<int32_t>();
-	if (bind_data->block_size <= 0) {
-		throw BinderException("Invalid blockSize in metadata: must be positive");
-	}
-	bind_data->n_rows = meta.at("nRows").get<int64_t>();
-	bind_data->n_cols = meta.at("nCols").get<int64_t>();
-
-	for (auto &pf : meta.at("partFiles")) {
-		std::string filename = pf.get<std::string>();
-		if (filename.find("..") != std::string::npos || filename.find('/') != std::string::npos ||
-		    filename.find('\\') != std::string::npos) {
-			throw BinderException("Invalid partition filename in metadata (path traversal detected): " + filename);
-		}
-		bind_data->part_files.push_back(std::move(filename));
-	}
-
-	auto maybe_filtered = meta.find("maybeFiltered");
-	if (maybe_filtered != meta.end() && !maybe_filtered->is_null()) {
-		for (auto &idx : *maybe_filtered) {
-			bind_data->block_indices.push_back(idx.get<int32_t>());
-		}
-	} else {
-		// all partitions in order
-		for (int32_t i = 0; i < static_cast<int32_t>(bind_data->part_files.size()); ++i) {
-			bind_data->block_indices.push_back(i);
-		}
-	}
+	auto metadata = LoadBlockMatrixMetadata(fs, bind_data->path);
+	bind_data->block_size = metadata.block_size;
+	bind_data->n_rows = metadata.n_rows;
+	bind_data->n_cols = metadata.n_cols;
+	bind_data->part_files = metadata.part_files;
+	bind_data->block_indices = metadata.block_indices;
 
 	// Output schema: (row_idx BIGINT, col_idx BIGINT, value DOUBLE)
 	names = {"row_idx", "col_idx", "value"};
@@ -289,7 +309,8 @@ static void HailBlockMatrixScan(ClientContext &context, TableFunctionInput &data
 			std::string part_path = bind_data.path + "/parts/" + bind_data.part_files[part_idx];
 			int32_t block_idx = bind_data.block_indices[part_idx];
 
-			BlockInfo bi = ComputeBlockInfo(block_idx, bind_data.block_size, bind_data.n_rows, bind_data.n_cols);
+			BlockMatrixBlockInfo bi =
+			    ComputeBlockMatrixBlockInfo(block_idx, bind_data.block_size, bind_data.n_rows, bind_data.n_cols);
 			local_state.global_row_start = bi.global_row_start;
 			local_state.global_col_start = bi.global_col_start;
 			local_state.block_n_rows = bi.block_n_rows;

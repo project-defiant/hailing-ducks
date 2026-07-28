@@ -1,10 +1,16 @@
 #include "hail_ld_query.hpp"
+#include "hail_table_scanner.hpp"
+#include "hail_blockmatrix_scanner.hpp"
+#include "hail_codec.hpp"
 
 #include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/function/table_function.hpp"
 #include "duckdb/parser/parsed_data/create_scalar_function_info.hpp"
+#include "duckdb/parser/keyword_helper.hpp"
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/constants.hpp"
+#include "duckdb/common/file_system.hpp"
+#include "duckdb/main/appender.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdio>
@@ -12,7 +18,13 @@
 #include <vector>
 #include <string>
 #include <unordered_set>
+#include <unordered_map>
+#include <map>
+#include <list>
 #include <regex>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 
 namespace duckdb {
 
@@ -83,6 +95,23 @@ struct PreflightOutRow {
 	int32_t code;
 };
 
+// A variant that passed all preflight structural checks (well-formed, in-locus, sole allele pair at
+// its position) and is a candidate for real HailTable resolution (see ClassifyLocusVariants below).
+struct LocusCandidate {
+	std::string token;
+	std::string contig;
+	int64_t pos;
+	std::string ref;
+	std::string alt;
+};
+
+// The parsed (contig, start, end) of a locus_range string, as consumed by outside-locus filtering.
+struct LocusInterval {
+	std::string contig;
+	int64_t start = 0;
+	int64_t end = 0;
+};
+
 struct PreflightBindData : public TableFunctionData {
 	std::string request_arg;
 };
@@ -110,31 +139,27 @@ struct PreflightLocalState : public LocalTableFunctionState {
 	idx_t next = 0;
 };
 
-// Shared per-locus classification: parses raw variant tokens against a locus range and appends
-// variant-status events (dedupe, outside_locus, ambiguous/flipped allele grouping) to `rows`.
-// Used by both the single-locus inline function and the multi-locus request-file function.
-static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
-                                  const std::vector<std::string> &raw_tokens, std::vector<PreflightOutRow> &rows) {
-	// parse locus_range -> contig:start-end; a malformed range is a structural error, not something
-	// to silently ignore (silently skipping outside-locus filtering would let out-of-range variants
-	// through undetected).
-	string locus_contig;
-	int64_t locus_start = 0, locus_end = 0;
+// Parses a "<contig>:<start>-<end>" locus range string. A malformed range is a structural error,
+// not something to silently ignore (silently skipping outside-locus filtering would let out-of-range
+// variants through undetected). Shared by ClassifyLocusVariants and the HT partition-pruning path.
+static LocusInterval ParseLocusRangeOrThrow(const std::string &locus_range, const std::string &locus_id,
+                                            const std::string &caller_name) {
+	LocusInterval interval;
 	bool malformed = true;
 	if (!locus_range.empty()) {
 		// expect e.g. chr1:100-200
 		auto colon = locus_range.find(':');
 		if (colon != string::npos) {
-			locus_contig = locus_range.substr(0, colon);
+			interval.contig = locus_range.substr(0, colon);
 			string rest = locus_range.substr(colon + 1);
 			auto dash = rest.find('-');
 			if (dash != string::npos) {
 				string sstart = rest.substr(0, dash);
 				string send = rest.substr(dash + 1);
 				try {
-					locus_start = stoll(sstart);
-					locus_end = stoll(send);
-					malformed = !(locus_start <= locus_end);
+					interval.start = stoll(sstart);
+					interval.end = stoll(send);
+					malformed = !(interval.start <= interval.end);
 				} catch (...) {
 					malformed = true;
 				}
@@ -142,10 +167,25 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 		}
 	}
 	if (malformed) {
-		throw BinderException("hail_ld_preflight: malformed locus range '%s' for locus_id '%s' (expected "
+		throw BinderException("%s: malformed locus range '%s' for locus_id '%s' (expected "
 		                      "'<contig>:<start>-<end>' with start <= end)",
-		                      locus_range, locus_id);
+		                      caller_name, locus_range, locus_id);
 	}
+	return interval;
+}
+
+// Shared per-locus classification: parses raw variant tokens against a locus range and appends
+// variant-status events (dedupe, outside_locus, ambiguous/flipped allele grouping) to `rows`.
+// Variants that pass every structural check are also appended to `candidates` (still without a
+// terminal status row) for callers that go on to do real HailTable resolution; `interval` receives
+// the parsed locus range. Used by the single-locus inline function, the multi-locus request-file
+// function, and (via candidates/interval) the HT resolver.
+static void ClassifyLocusVariants(const std::string &locus_id, const std::string &locus_range,
+                                  const std::vector<std::string> &raw_tokens, std::vector<PreflightOutRow> &rows,
+                                  std::vector<LocusCandidate> &candidates, LocusInterval &interval) {
+	interval = ParseLocusRangeOrThrow(locus_range, locus_id, "hail_ld_preflight");
+	const string &locus_contig = interval.contig;
+	int64_t locus_start = interval.start, locus_end = interval.end;
 	const bool locus_ok = true;
 
 	// temp parsed list preserves order
@@ -260,68 +300,143 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 			auto &p = parsed_list[idx];
 			allele_pairs.insert(p.ref + ":" + p.alt);
 		}
-		if (allele_pairs.size() > 2) {
-			// request-level conflict (>2 distinct allele pairs at the same contig/position): exclude
-			// from LD planning before any HT work. Code 4 (ambiguous_in_ht) is reserved for ambiguity
-			// discovered later, during HT resolution.
+		if (allele_pairs.size() > 1) {
+			// request-level conflict (2+ distinct allele pairs at the same contig/position, whether or
+			// not they're ref/alt flips of each other): exclude ALL of them from LD planning before any
+			// HT work. Real exact/flipped resolution is the HT resolver's job (against actual HT rows),
+			// not a preflight-time comparison between sibling requested IDs. Code 4 (ambiguous_in_ht) is
+			// reserved for ambiguity discovered later, during HT resolution.
 			for (auto idx : indices) {
 				rows.push_back({locus_id, parsed_list[idx].token, 6});
 			}
 			continue;
 		}
-		if (allele_pairs.size() == 1) {
-			// single allele pair -> first encountered marked resolved_exact
-			// preserve input order: emit rows for indices in order, first 0, others 0 as duplicates handled earlier
-			for (auto idx : indices) {
-				rows.push_back({locus_id, parsed_list[idx].token, 0});
-			}
-			continue;
-		}
-		// allele_pairs.size() == 2
-		// check if the two pairs are flips of each other
-		auto it = allele_pairs.begin();
-		string a1 = *it;
-		++it;
-		string a2 = *it;
-		auto split_pair = [&](const string &s) -> pair<string, string> {
-			auto pos = s.find(':');
-			return {s.substr(0, pos), s.substr(pos + 1)};
-		};
-		auto pa1 = split_pair(a1);
-		auto pa2 = split_pair(a2);
-		bool is_flip = (pa1.first == pa2.second && pa1.second == pa2.first);
-		if (is_flip) {
-			// find first occurrence among indices; mark first as resolved_exact, others as resolved_flipped if they are
-			// flipped relative to first determine which allele pair was seen first
-			string first_pair = "";
-			string first_token_pair = "";
-			for (auto idx : indices) {
-				auto &p = parsed_list[idx];
-				string pair = p.ref + ":" + p.alt;
-				if (first_pair.empty()) {
-					first_pair = pair;
-					first_token_pair = pair;
-					break;
-				}
-			}
-			// emit: for each in indices, if pair==first_pair -> 0 else -> 1
-			for (auto idx : indices) {
-				auto &p = parsed_list[idx];
-				string pair = p.ref + ":" + p.alt;
-				if (pair == first_pair)
-					rows.push_back({locus_id, p.token, 0});
-				else
-					rows.push_back({locus_id, p.token, 1});
-			}
-		} else {
-			// two distinct non-flip allele pairs at the same position -> request-level conflict:
-			// exclude ALL of them from LD planning (multiple_variants_at_position, 6), not just the
-			// later-encountered ones, since none can be trusted as the single intended variant.
-			for (auto idx : indices) {
-				rows.push_back({locus_id, parsed_list[idx].token, 6});
-			}
+		// single allele pair -> candidate for real HT resolution; preflight only marks it as
+		// structurally clean (placeholder 0), not yet confirmed against HT.
+		for (auto idx : indices) {
+			auto &p = parsed_list[idx];
+			rows.push_back({locus_id, p.token, 0});
+			candidates.push_back({p.token, p.contig, stoll(p.pos), p.ref, p.alt});
 		}
 	}
+}
+
+// ---------------------------------------------------------------------------
+// HT partition pruning
+// ---------------------------------------------------------------------------
+
+// Returns the contiguous [lo, hi) band of partition indices whose range could contain rows of
+// `contig`, using only the table's own recorded partition boundaries -- never a hardcoded reference
+// contig order. Hail's real contig ordering is NOT lexical (confirmed against a real PanUKBB HT
+// whose last partition's bound spans chr7_KI270803v1_alt -> chr19_KI270938v1_alt), so contig name
+// comparisons here are opaque equality checks only. Because partitions are contiguous and
+// non-overlapping in the table's true sort order, every partition touching a given contig forms one
+// contiguous index range -- found by collecting every partition whose start OR end bound names that
+// contig and taking the min/max of that set. Returns {0, 0} if the contig never appears.
+static std::pair<idx_t, idx_t> FindPartitionRangeForContig(const std::vector<HailTablePartitionBound> &bounds,
+                                                           const std::string &contig) {
+	idx_t lo = bounds.size();
+	idx_t hi = 0;
+	for (idx_t i = 0; i < bounds.size(); ++i) {
+		if (bounds[i].start_contig == contig || bounds[i].end_contig == contig) {
+			lo = std::min(lo, i);
+			hi = std::max(hi, i + 1);
+		}
+	}
+	if (lo >= hi) {
+		return {0, 0};
+	}
+	return {lo, hi};
+}
+
+// Whether a single partition's bound could contain a row in [qstart, qend] on `contig`. Only prunes
+// by position when the partition's start and end share `contig` (a pure single-contig partition);
+// a partition that straddles a contig boundary is always kept, since deciding which sub-range of it
+// belongs to `contig` would require a full reference contig-order table -- safe (never wrongly
+// pruned), just not maximally pruned.
+static bool PartitionCouldContainPosition(const HailTablePartitionBound &b, const std::string &contig, int64_t qstart,
+                                          int64_t qend) {
+	if (b.start_contig != contig || b.end_contig != contig) {
+		return true;
+	}
+	int64_t effective_start = b.include_start ? b.start_position : b.start_position + 1;
+	int64_t effective_end = b.include_end ? b.end_position : b.end_position - 1;
+	return effective_start <= qend && effective_end >= qstart;
+}
+
+// Selects the partition indices that could contain rows for the given locus interval. Callers must
+// check `bounds.empty()` themselves first: an empty `bounds` means no partitioner info is available
+// at all (unkeyed table, or no _jRangeBounds), which is "must scan every partition," not "select
+// zero partitions" -- this function only makes sense once real bounds exist.
+static std::vector<idx_t> SelectPartitionsForLocus(const std::vector<HailTablePartitionBound> &bounds,
+                                                   const LocusInterval &interval) {
+	std::vector<idx_t> selected;
+	auto range = FindPartitionRangeForContig(bounds, interval.contig);
+	for (idx_t i = range.first; i < range.second; ++i) {
+		if (PartitionCouldContainPosition(bounds[i], interval.contig, interval.start, interval.end)) {
+			selected.push_back(i);
+		}
+	}
+	return selected;
+}
+
+// hail_ld_ht_partitions_for_locus(ht_path, locus_range) -> partition_idx: a small, directly
+// queryable introspection function proving partition-pruning behavior through observable output
+// (per the PRD's "verify external behavior, not internal structures" testing rule), mirroring the
+// existing hail_ld_preflight_debug precedent.
+struct HTPartitionsBindData : public TableFunctionData {
+	std::vector<idx_t> partitions;
+};
+
+static unique_ptr<FunctionData> HailLDHTPartitionsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"partition_idx"};
+	return_types = {LogicalType::INTEGER};
+	auto bind_data = make_uniq<HTPartitionsBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string locus_range = input.inputs[1].GetValue<string>();
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadHailTableMetadata(fs, ht_path);
+	auto interval = ParseLocusRangeOrThrow(locus_range, "n/a", "hail_ld_ht_partitions_for_locus");
+
+	if (metadata.range_bounds.empty()) {
+		for (idx_t i = 0; i < metadata.part_files.size(); ++i) {
+			bind_data->partitions.push_back(i);
+		}
+	} else {
+		bind_data->partitions = SelectPartitionsForLocus(metadata.range_bounds, interval);
+	}
+	return std::move(bind_data);
+}
+
+struct HTPartitionsLocalState : public LocalTableFunctionState {
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDHTPartitionsInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	return make_uniq<HTPartitionsLocalState>();
+}
+
+static void HailLDHTPartitionsScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<HTPartitionsBindData>();
+	auto &local = data.local_state->Cast<HTPartitionsLocalState>();
+	if (local.next >= bind_data.partitions.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, bind_data.partitions.size() - local.next);
+	auto &out_vec = output.data[0];
+	for (idx_t i = 0; i < to_emit; ++i) {
+		FlatVector::GetData<int32_t>(out_vec)[i] = static_cast<int32_t>(bind_data.partitions[local.next + i]);
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
 }
 
 static unique_ptr<LocalTableFunctionState>
@@ -344,7 +459,9 @@ HailLDPreflightInitLocal(ExecutionContext &context, TableFunctionInitInput &inpu
 	std::string varlist = parts[2];
 	auto raw_tokens = StringUtil::Split(varlist, ",");
 
-	ClassifyLocusVariants(locus_id, locus_range, raw_tokens, state->rows);
+	std::vector<LocusCandidate> unused_candidates;
+	LocusInterval unused_interval;
+	ClassifyLocusVariants(locus_id, locus_range, raw_tokens, state->rows, unused_candidates, unused_interval);
 	return std::move(state);
 }
 
@@ -388,6 +505,56 @@ static void HailLDPreflightScan(ClientContext &context, TableFunctionInput &data
 	output.SetCardinality(to_emit);
 }
 
+// One parsed row of a request-file Parquet: (locus_id VARCHAR, locus VARCHAR, variant_ids LIST<VARCHAR>).
+struct LocusRequest {
+	std::string locus_id;
+	std::string locus_range;
+	std::vector<std::string> raw_tokens;
+};
+
+// Reads a request-file Parquet with columns (locus_id VARCHAR, locus VARCHAR, variant_ids
+// LIST<VARCHAR>), one row per fine-mapping locus. Shared by hail_ld_preflight_requests and
+// hail_ld_resolve_ht so the file-reading/NULL-checking logic isn't duplicated between them.
+static std::vector<LocusRequest> ReadLocusRequests(ClientContext &context, const std::string &requests_path,
+                                                   const std::string &caller_name) {
+	std::string escaped_path = StringUtil::Replace(requests_path, "'", "''");
+
+	Connection con(*context.db);
+	auto result = con.Query("SELECT locus_id, locus, variant_ids FROM read_parquet('" + escaped_path + "')");
+	if (result->HasError()) {
+		throw BinderException("%s: failed to read request file '%s': %s", caller_name, requests_path,
+		                      result->GetError());
+	}
+	std::vector<LocusRequest> requests;
+	while (auto chunk = result->Fetch()) {
+		for (idx_t row = 0; row < chunk->size(); ++row) {
+			auto locus_id_value = chunk->GetValue(0, row);
+			auto locus_range_value = chunk->GetValue(1, row);
+			auto variant_ids_value = chunk->GetValue(2, row);
+			if (locus_id_value.IsNull() || locus_range_value.IsNull() || variant_ids_value.IsNull()) {
+				throw BinderException(
+				    "%s: request file '%s' row %d has a NULL locus_id/locus/variant_ids column; all three "
+				    "columns are required",
+				    caller_name, requests_path, (int)row);
+			}
+			LocusRequest req;
+			req.locus_id = locus_id_value.GetValue<string>();
+			req.locus_range = locus_range_value.GetValue<string>();
+			for (auto &item : ListValue::GetChildren(variant_ids_value)) {
+				if (item.IsNull()) {
+					throw BinderException(
+					    "%s: request file '%s' locus_id '%s' has a NULL entry in variant_ids; all requested "
+					    "variant IDs must be non-NULL",
+					    caller_name, requests_path, req.locus_id);
+				}
+				req.raw_tokens.push_back(item.GetValue<string>());
+			}
+			requests.push_back(std::move(req));
+		}
+	}
+	return requests;
+}
+
 // Multi-locus request file: reads a Parquet file with columns
 // (locus_id VARCHAR, locus VARCHAR, variant_ids LIST<VARCHAR>), one row per fine-mapping locus,
 // and classifies each locus's variant list the same way hail_ld_preflight does for a single locus.
@@ -404,38 +571,12 @@ static unique_ptr<FunctionData> HailLDPreflightRequestsBind(ClientContext &conte
 		return std::move(bind_data);
 	}
 	std::string requests_path = input.inputs[0].GetValue<string>();
-	std::string escaped_path = StringUtil::Replace(requests_path, "'", "''");
-
-	Connection con(*context.db);
-	auto result = con.Query("SELECT locus_id, locus, variant_ids FROM read_parquet('" + escaped_path + "')");
-	if (result->HasError()) {
-		throw BinderException("hail_ld_preflight_requests: failed to read request file '%s': %s", requests_path,
-		                      result->GetError());
-	}
-	while (auto chunk = result->Fetch()) {
-		for (idx_t row = 0; row < chunk->size(); ++row) {
-			auto locus_id_value = chunk->GetValue(0, row);
-			auto locus_range_value = chunk->GetValue(1, row);
-			auto variant_ids_value = chunk->GetValue(2, row);
-			if (locus_id_value.IsNull() || locus_range_value.IsNull() || variant_ids_value.IsNull()) {
-				throw BinderException(
-				    "hail_ld_preflight_requests: request file '%s' row %d has a NULL locus_id/locus/variant_ids "
-				    "column; all three columns are required",
-				    requests_path, (int)row);
-			}
-			std::string locus_id = locus_id_value.GetValue<string>();
-			std::string locus_range = locus_range_value.GetValue<string>();
-			std::vector<std::string> raw_tokens;
-			for (auto &item : ListValue::GetChildren(variant_ids_value)) {
-				if (item.IsNull()) {
-					throw BinderException("hail_ld_preflight_requests: request file '%s' locus_id '%s' has a NULL "
-					                      "entry in variant_ids; all requested variant IDs must be non-NULL",
-					                      requests_path, locus_id);
-				}
-				raw_tokens.push_back(item.GetValue<string>());
-			}
-			ClassifyLocusVariants(locus_id, locus_range, raw_tokens, bind_data->rows);
-		}
+	auto requests = ReadLocusRequests(context, requests_path, "hail_ld_preflight_requests");
+	for (auto &req : requests) {
+		std::vector<LocusCandidate> unused_candidates;
+		LocusInterval unused_interval;
+		ClassifyLocusVariants(req.locus_id, req.locus_range, req.raw_tokens, bind_data->rows, unused_candidates,
+		                      unused_interval);
 	}
 	return std::move(bind_data);
 }
@@ -446,6 +587,1074 @@ HailLDPreflightRequestsInitLocal(ExecutionContext &context, TableFunctionInitInp
 	auto &bind = input.bind_data->Cast<PreflightRequestsBindData>();
 	state->rows = bind.rows;
 	return std::move(state);
+}
+
+// ---------------------------------------------------------------------------
+// hail_ld_resolve_ht(ht_path, requests_path): batch HailTable resolver
+// ---------------------------------------------------------------------------
+
+// One resolved (or terminal-status) variant event: a superset of PreflightOutRow with the extra
+// columns real HT resolution can fill in. Nullable columns are tracked with explicit flags rather
+// than sentinel values, since idx/allele_order have no value that can't legitimately occur.
+struct HTResolveOutRow {
+	std::string locus_id;
+	std::string requested_variant_id;
+	std::string matched_variant_id;
+	bool has_matched_variant_id = false;
+	int64_t idx = 0;
+	bool has_idx = false;
+	int32_t allele_order = 0;
+	bool has_allele_order = false;
+	int32_t status_code = 0;
+};
+
+struct HTResolveBindData : public TableFunctionData {
+	std::vector<HTResolveOutRow> rows;
+};
+
+// One HT-side match found for a candidate: its row idx, the HT's own allele pair (used to
+// reconstruct matched_variant_id, which can differ from requested_variant_id on a flip), and the
+// allele_order sign (1 = exact, -1 = flipped).
+struct HTMatch {
+	int64_t idx;
+	std::string allele0, allele1;
+	int32_t allele_order;
+};
+
+// Core HT resolution logic, independent of any particular table function's argument shape: reused
+// by hail_ld_resolve_ht directly and by hail_ld_materialize (issue #21), which needs this exact same
+// single-pass result in memory rather than re-invoking hail_ld_resolve_ht via SQL (table function
+// arguments can't contain subqueries, and re-running it would violate "one physical extraction").
+static std::vector<HTResolveOutRow> ResolveHTCore(ClientContext &context, const std::string &ht_path,
+                                                  const std::string &requests_path) {
+	std::vector<HTResolveOutRow> rows;
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadHailTableMetadata(fs, ht_path);
+
+	// Real HT schemas carry many more fields than these three (rsid, AF, liftover metadata, ...);
+	// DecodeHailTableRow decodes the FULL row (skipping past whatever else is there) so the byte
+	// cursor stays correctly synced -- this resolver only reads back the columns it needs, by name.
+	int locus_col = -1, alleles_col = -1, idx_col = -1;
+	for (idx_t i = 0; i < metadata.vtype.children.size(); ++i) {
+		auto &f = metadata.vtype.children[i];
+		if (f.name == "locus" && f.kind == VKind::Locus) {
+			locus_col = static_cast<int>(i);
+		} else if (f.name == "alleles" && f.kind == VKind::Array && !f.children.empty() &&
+		           f.children[0].kind == VKind::String) {
+			alleles_col = static_cast<int>(i);
+		} else if (f.name == "idx" && f.kind == VKind::Int64) {
+			idx_col = static_cast<int>(i);
+		}
+	}
+	if (locus_col < 0 || alleles_col < 0 || idx_col < 0) {
+		throw BinderException(
+		    "hail_ld_resolve_ht: HailTable at '%s' is missing a required 'locus'/'alleles'/'idx' field "
+		    "(found locus=%s, alleles=%s, idx=%s) -- this is a structural precondition for HT resolution, "
+		    "not biological missingness",
+		    ht_path, locus_col >= 0 ? "yes" : "no", alleles_col >= 0 ? "yes" : "no", idx_col >= 0 ? "yes" : "no");
+	}
+
+	vector<LogicalType> row_types;
+	for (auto &f : metadata.vtype.children) {
+		row_types.push_back(VTypeToDuckDBType(f));
+	}
+	DataChunk row_chunk;
+	row_chunk.Initialize(context, row_types, 1);
+
+	auto requests = ReadLocusRequests(context, requests_path, "hail_ld_resolve_ht");
+	for (auto &req : requests) {
+		std::vector<PreflightOutRow> preflight_rows;
+		std::vector<LocusCandidate> candidates;
+		LocusInterval interval;
+		ClassifyLocusVariants(req.locus_id, req.locus_range, req.raw_tokens, preflight_rows, candidates, interval);
+
+		// Terminal preflight statuses (outside_locus/unsupported/multiple_variants_at_position) pass
+		// straight through, never touching HT; the placeholder "0" rows are dropped here since their
+		// corresponding candidate gets its own authoritative status below.
+		for (auto &r : preflight_rows) {
+			if (r.code == 0) {
+				continue;
+			}
+			HTResolveOutRow out;
+			out.locus_id = r.locus_id;
+			out.requested_variant_id = r.req;
+			out.status_code = r.code;
+			rows.push_back(std::move(out));
+		}
+		if (candidates.empty()) {
+			continue;
+		}
+
+		std::vector<idx_t> selected_partitions;
+		if (metadata.range_bounds.empty()) {
+			// No partitioner info available (unkeyed table / no _jRangeBounds) -- scan everything.
+			for (idx_t i = 0; i < metadata.part_files.size(); ++i) {
+				selected_partitions.push_back(i);
+			}
+		} else {
+			selected_partitions = SelectPartitionsForLocus(metadata.range_bounds, interval);
+		}
+
+		std::unordered_map<std::string, std::vector<idx_t>> candidates_by_pos;
+		for (idx_t i = 0; i < candidates.size(); ++i) {
+			auto &c = candidates[i];
+			candidates_by_pos[c.contig + ":" + std::to_string(c.pos)].push_back(i);
+		}
+
+		std::vector<std::vector<HTMatch>> matches(candidates.size());
+		for (idx_t part_idx : selected_partitions) {
+			std::string part_path = ht_path + "/" + metadata.rows_rel_path + "/parts/" + metadata.part_files[part_idx];
+			auto handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			auto decoder = make_decoder(metadata.buffer_spec_name, *handle, part_path);
+			while (true) {
+				row_chunk.Reset();
+				if (!DecodeHailTableRow(*decoder, metadata.etype, row_chunk, 0)) {
+					break;
+				}
+				// `locus` is nullable in real Hail wire format (e.g. a row whose liftover to this
+				// build failed) -- StructValue::GetChildren throws on a NULL struct, so a row with no
+				// locus can't be positioned at all and must be skipped before touching its children.
+				auto locus_value = row_chunk.GetValue(locus_col, 0);
+				if (locus_value.IsNull()) {
+					continue;
+				}
+				auto &locus_children = StructValue::GetChildren(locus_value);
+				std::string row_contig = locus_children[0].GetValue<string>();
+				int64_t row_pos = locus_children[1].GetValue<int32_t>();
+
+				auto alleles_value = row_chunk.GetValue(alleles_col, 0);
+				if (alleles_value.IsNull()) {
+					continue;
+				}
+				auto &allele_children = ListValue::GetChildren(alleles_value);
+				if (allele_children.size() != 2) {
+					// Multi-allelic (or mono-allelic) HT rows are never eligible for biallelic matching.
+					continue;
+				}
+				if (allele_children[0].IsNull() || allele_children[1].IsNull()) {
+					continue;
+				}
+
+				auto pos_it = candidates_by_pos.find(row_contig + ":" + std::to_string(row_pos));
+				if (pos_it == candidates_by_pos.end()) {
+					continue;
+				}
+
+				std::string a0 = allele_children[0].GetValue<string>();
+				std::string a1 = allele_children[1].GetValue<string>();
+				int64_t row_idx = row_chunk.GetValue(idx_col, 0).GetValue<int64_t>();
+
+				for (idx_t cand_idx : pos_it->second) {
+					auto &c = candidates[cand_idx];
+					if (a0 == c.ref && a1 == c.alt) {
+						matches[cand_idx].push_back({row_idx, a0, a1, 1});
+					} else if (a0 == c.alt && a1 == c.ref) {
+						matches[cand_idx].push_back({row_idx, a0, a1, -1});
+					}
+				}
+			}
+		}
+
+		for (idx_t i = 0; i < candidates.size(); ++i) {
+			auto &c = candidates[i];
+			auto &m = matches[i];
+			HTResolveOutRow out;
+			out.locus_id = req.locus_id;
+			out.requested_variant_id = c.token;
+			if (m.empty()) {
+				out.status_code = 2; // not_found_in_ht
+			} else if (m.size() > 1) {
+				out.status_code = 4; // ambiguous_in_ht: HT itself has >1 row matching this candidate
+			} else {
+				out.has_matched_variant_id = true;
+				out.matched_variant_id =
+				    c.contig + "_" + std::to_string(c.pos) + "_" + m[0].allele0 + "_" + m[0].allele1;
+				out.has_idx = true;
+				out.idx = m[0].idx;
+				out.has_allele_order = true;
+				out.allele_order = m[0].allele_order;
+				out.status_code = m[0].allele_order == 1 ? 0 : 1; // resolved_exact / resolved_flipped
+			}
+			rows.push_back(std::move(out));
+		}
+	}
+
+	return rows;
+}
+
+static unique_ptr<FunctionData> HailLDResolveHTBind(ClientContext &context, TableFunctionBindInput &input,
+                                                    vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
+	         "allele_order", "status_domain",        "status_code"};
+	return_types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::BIGINT,
+	                LogicalType::INTEGER, LogicalType::VARCHAR, LogicalType::INTEGER};
+	auto bind_data = make_uniq<HTResolveBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string requests_path = input.inputs[1].GetValue<string>();
+	bind_data->rows = ResolveHTCore(context, ht_path, requests_path);
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDResolveHTInitGlobal(ClientContext &context,
+                                                                      TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct HTResolveLocalState : public LocalTableFunctionState {
+	std::vector<HTResolveOutRow> rows;
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDResolveHTInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<HTResolveLocalState>();
+	auto &bind = input.bind_data->Cast<HTResolveBindData>();
+	state->rows = bind.rows;
+	return std::move(state);
+}
+
+static void HailLDResolveHTScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<HTResolveLocalState>();
+	if (local.next >= local.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, local.rows.size() - local.next);
+
+	auto &locus_vec = output.data[0];
+	auto &req_vec = output.data[1];
+	auto &matched_vec = output.data[2];
+	auto &idx_vec = output.data[3];
+	auto &allele_order_vec = output.data[4];
+	auto &dom_vec = output.data[5];
+	auto &code_vec = output.data[6];
+
+	for (idx_t i = 0; i < to_emit; ++i) {
+		auto &r = local.rows[local.next + i];
+		FlatVector::GetData<string_t>(locus_vec)[i] = StringVector::AddString(locus_vec, r.locus_id);
+		FlatVector::GetData<string_t>(req_vec)[i] = StringVector::AddString(req_vec, r.requested_variant_id);
+		if (r.has_matched_variant_id) {
+			FlatVector::GetData<string_t>(matched_vec)[i] = StringVector::AddString(matched_vec, r.matched_variant_id);
+		} else {
+			FlatVector::SetNull(matched_vec, i, true);
+		}
+		if (r.has_idx) {
+			FlatVector::GetData<int64_t>(idx_vec)[i] = r.idx;
+		} else {
+			FlatVector::SetNull(idx_vec, i, true);
+		}
+		if (r.has_allele_order) {
+			FlatVector::GetData<int32_t>(allele_order_vec)[i] = r.allele_order;
+		} else {
+			FlatVector::SetNull(allele_order_vec, i, true);
+		}
+		FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "variant");
+		FlatVector::GetData<int32_t>(code_vec)[i] = r.status_code;
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
+}
+
+// ---------------------------------------------------------------------------
+// hail_ld_bm_pairs(bm_path, resolved): BlockMatrix pair extraction for one locus
+// ---------------------------------------------------------------------------
+
+struct BMResolvedVariant {
+	int64_t idx;
+	int32_t allele_order;
+};
+
+struct BMPairOutRow {
+	int64_t idx_i;
+	int64_t idx_j;
+	double r = 0.0;
+	bool has_r = false;
+	int32_t status_code;
+};
+
+struct HailLDBMPairsBindData : public TableFunctionData {
+	std::vector<BMPairOutRow> rows;
+};
+
+static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                  vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"idx_i", "idx_j", "r", "bm_status_domain", "bm_status_code"};
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT, LogicalType::DOUBLE, LogicalType::VARCHAR,
+	                LogicalType::INTEGER};
+	auto bind_data = make_uniq<HailLDBMPairsBindData>();
+	if (input.inputs.size() < 2) {
+		return std::move(bind_data);
+	}
+	std::string bm_path = input.inputs[0].GetValue<string>();
+
+	std::vector<BMResolvedVariant> resolved;
+	for (auto &item : ListValue::GetChildren(input.inputs[1])) {
+		if (item.IsNull()) {
+			continue;
+		}
+		auto &fields = StructValue::GetChildren(item);
+		resolved.push_back({fields[0].GetValue<int64_t>(), fields[1].GetValue<int32_t>()});
+	}
+	// Canonical pair generation (idx_i < idx_j) falls out naturally from generating pairs over a
+	// sorted-by-idx list, rather than sorting each pair individually.
+	std::sort(resolved.begin(), resolved.end(),
+	          [](const BMResolvedVariant &a, const BMResolvedVariant &b) { return a.idx < b.idx; });
+	if (resolved.size() < 2) {
+		return std::move(bind_data); // fewer than 2 resolved variants -> no pairs to form
+	}
+
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadBlockMatrixMetadata(fs, bm_path);
+	int64_t n_block_cols = (metadata.n_cols + metadata.block_size - 1) / metadata.block_size;
+
+	std::unordered_map<int32_t, idx_t> block_idx_to_part_pos;
+	for (idx_t i = 0; i < metadata.block_indices.size(); ++i) {
+		block_idx_to_part_pos[metadata.block_indices[i]] = i;
+	}
+
+	// Decoded-block cache, keyed by flat block index: a block file is opened and decompressed lazily
+	// on first need, then reused for every later pair whose cell falls in the same block -- this is
+	// what makes each touched block get read once per this locus's whole pair set. "Confirmed
+	// missing" is memoized too, so a repeatedly-requested absent block isn't re-looked-up either.
+	struct DecodedBlock {
+		std::vector<double> data;
+		bool is_transpose;
+		int64_t block_n_rows, block_n_cols;
+	};
+	std::unordered_map<int32_t, unique_ptr<DecodedBlock>> block_cache;
+	std::unordered_set<int32_t> confirmed_missing;
+
+	// Returns the raw (uncorrected) cell value for the pair (idx_smaller, idx_larger); sets
+	// out_missing_block when the tile containing this cell has no physical part file (Hail's
+	// `maybeFiltered` sparse storage).
+	//
+	// Ground-truth-verified against real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data
+	// (fetched and manually LZ4-decoded two specific blocks -- one diagonal, one off-diagonal -- and
+	// compared against real LD values from an independent Hail-computed reference): the tile to open
+	// is selected by (row-band = idx_larger's band, col-band = idx_smaller's band) as established
+	// earlier, but the array offset WITHIN that tile is the opposite of what tile selection might
+	// suggest -- the array's row axis holds idx_smaller's own local offset (relative to its own
+	// band) and the col axis holds idx_larger's own local offset, regardless of which one determined
+	// the tile's row-band vs col-band identity. This holds for diagonal tiles (where both indices
+	// share one band, and the "row=smaller/col=larger" placement is the only new information) and
+	// off-diagonal tiles alike (verified independently for both).
+	auto get_cell = [&](int64_t idx_smaller, int64_t idx_larger, bool &out_missing_block) -> double {
+		int64_t block_row = idx_larger / metadata.block_size;
+		int64_t block_col = idx_smaller / metadata.block_size;
+		int32_t block_idx = static_cast<int32_t>(block_row * n_block_cols + block_col);
+
+		if (confirmed_missing.count(block_idx)) {
+			out_missing_block = true;
+			return 0.0;
+		}
+		auto cache_it = block_cache.find(block_idx);
+		if (cache_it == block_cache.end()) {
+			auto pos_it = block_idx_to_part_pos.find(block_idx);
+			if (pos_it == block_idx_to_part_pos.end()) {
+				confirmed_missing.insert(block_idx);
+				out_missing_block = true;
+				return 0.0;
+			}
+			std::string part_path = bm_path + "/parts/" + metadata.part_files[pos_it->second];
+			auto handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			std::vector<uint8_t> raw = DecompressHailLz4Stream(*handle, part_path);
+			if (raw.size() < 9) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block file too small: " + part_path);
+			}
+			size_t cursor = 0;
+			auto read32 = [&]() -> int32_t {
+				int32_t v = static_cast<int32_t>(raw[cursor]) | (static_cast<int32_t>(raw[cursor + 1]) << 8) |
+				            (static_cast<int32_t>(raw[cursor + 2]) << 16) |
+				            (static_cast<int32_t>(raw[cursor + 3]) << 24);
+				cursor += 4;
+				return v;
+			};
+			int32_t stored_rows = read32();
+			int32_t stored_cols = read32();
+			bool is_transpose = (raw[cursor++] != 0);
+			auto bi = ComputeBlockMatrixBlockInfo(block_idx, metadata.block_size, metadata.n_rows, metadata.n_cols);
+			if (stored_rows != bi.block_n_rows || stored_cols != bi.block_n_cols) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block dimension mismatch in " + part_path);
+			}
+			int64_t n_elements = static_cast<int64_t>(stored_rows) * stored_cols;
+			size_t data_bytes = static_cast<size_t>(n_elements) * sizeof(double);
+			if (raw.size() - cursor < data_bytes) {
+				throw IOException("hail_ld_bm_pairs: BlockMatrix block file data truncated: " + part_path);
+			}
+			auto block = make_uniq<DecodedBlock>();
+			block->data.resize(n_elements);
+			std::memcpy(block->data.data(), raw.data() + cursor, data_bytes);
+			block->is_transpose = is_transpose;
+			block->block_n_rows = bi.block_n_rows;
+			block->block_n_cols = bi.block_n_cols;
+			cache_it = block_cache.emplace(block_idx, std::move(block)).first;
+		}
+		auto &block = *cache_it->second;
+		int64_t array_row = idx_smaller - block_col * metadata.block_size;
+		int64_t array_col = idx_larger - block_row * metadata.block_size;
+		int64_t elem_idx = block.is_transpose ? (array_row * block.block_n_cols + array_col)
+		                                      : (array_col * block.block_n_rows + array_row);
+		return block.data[elem_idx];
+	};
+
+	for (idx_t a = 0; a < resolved.size(); ++a) {
+		for (idx_t b = a + 1; b < resolved.size(); ++b) {
+			auto &vi = resolved[a];
+			auto &vj = resolved[b];
+			if (vi.idx == vj.idx) {
+				continue; // never emit a diagonal row, even defensively against duplicate input idx
+			}
+			BMPairOutRow out;
+			out.idx_i = vi.idx;
+			out.idx_j = vj.idx;
+			if (vi.idx < 0 || vi.idx >= metadata.n_rows || vj.idx < 0 || vj.idx >= metadata.n_cols) {
+				out.status_code = 2; // bm_index_out_of_bounds
+				bind_data->rows.push_back(out);
+				continue;
+			}
+			bool missing_block = false;
+			// out.idx_i < out.idx_j always (resolved is sorted ascending, a < b); get_cell selects
+			// the tile and the within-tile array offset per the ground-truth-verified convention
+			// documented on its definition above.
+			double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
+			if (missing_block) {
+				out.status_code = 3; // bm_missing_block
+			} else if (std::isnan(raw_value)) {
+				out.status_code = 4; // bm_missing_or_nan
+			} else {
+				out.has_r = true;
+				out.r = raw_value * vi.allele_order * vj.allele_order;
+				out.status_code = 0; // bm_resolved
+			}
+			bind_data->rows.push_back(out);
+		}
+	}
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDBMPairsInitGlobal(ClientContext &context,
+                                                                    TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct BMPairsLocalState : public LocalTableFunctionState {
+	std::vector<BMPairOutRow> rows;
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDBMPairsInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<BMPairsLocalState>();
+	auto &bind = input.bind_data->Cast<HailLDBMPairsBindData>();
+	state->rows = bind.rows;
+	return std::move(state);
+}
+
+static void HailLDBMPairsScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<BMPairsLocalState>();
+	if (local.next >= local.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, local.rows.size() - local.next);
+
+	auto &idx_i_vec = output.data[0];
+	auto &idx_j_vec = output.data[1];
+	auto &r_vec = output.data[2];
+	auto &dom_vec = output.data[3];
+	auto &code_vec = output.data[4];
+
+	for (idx_t i = 0; i < to_emit; ++i) {
+		auto &row = local.rows[local.next + i];
+		FlatVector::GetData<int64_t>(idx_i_vec)[i] = row.idx_i;
+		FlatVector::GetData<int64_t>(idx_j_vec)[i] = row.idx_j;
+		if (row.has_r) {
+			FlatVector::GetData<double>(r_vec)[i] = row.r;
+		} else {
+			FlatVector::SetNull(r_vec, i, true);
+		}
+		FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "bm");
+		FlatVector::GetData<int32_t>(code_vec)[i] = row.status_code;
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
+}
+
+// ---------------------------------------------------------------------------
+// hail_ld_bm_pairs_batch(bm_path, resolved, max_cached_blocks := 64): multi-locus
+// BlockMatrix pair extraction sharing one query-local decompressed block cache.
+// ---------------------------------------------------------------------------
+
+struct BMBatchResolvedVariant {
+	int64_t idx;
+	int32_t allele_order;
+};
+
+struct BMBatchPairOutRow {
+	std::string locus_id;
+	int64_t idx_i;
+	int64_t idx_j;
+	double r = 0.0;
+	bool has_r = false;
+	int32_t status_code;
+};
+
+struct BMBatchStats {
+	int32_t blocks_opened = 0;
+	int32_t cache_hits = 0;
+	int32_t evictions = 0;
+};
+
+struct BMBatchResult {
+	std::vector<BMBatchPairOutRow> rows;
+	BMBatchStats stats;
+};
+
+struct DecodedBMBlock {
+	std::vector<double> data;
+	bool is_transpose;
+	int64_t block_n_rows, block_n_cols;
+};
+
+// A capacity-bounded LRU cache of decompressed BM blocks, shared across every locus processed in one
+// hail_ld_bm_pairs_batch call -- this is what lets overlapping loci reuse a block instead of
+// re-opening/re-decompressing it, and what makes eviction under a tight `max_cached_blocks` limit
+// deterministic (always evicts the single least-recently-used entry, never a data-dependent choice).
+class LRUBlockCache {
+public:
+	explicit LRUBlockCache(int32_t capacity) : capacity_(std::max(capacity, 1)) {
+	}
+
+	DecodedBMBlock *Get(int32_t block_idx, BMBatchStats &stats) {
+		auto pos_it = pos_.find(block_idx);
+		if (pos_it == pos_.end()) {
+			return nullptr;
+		}
+		stats.cache_hits++;
+		order_.splice(order_.begin(), order_, pos_it->second); // move to front (most recently used)
+		return data_.at(block_idx).get();
+	}
+
+	void Put(int32_t block_idx, unique_ptr<DecodedBMBlock> block, BMBatchStats &stats) {
+		if (static_cast<int32_t>(order_.size()) >= capacity_) {
+			int32_t evict_idx = order_.back();
+			order_.pop_back();
+			pos_.erase(evict_idx);
+			data_.erase(evict_idx);
+			stats.evictions++;
+		}
+		order_.push_front(block_idx);
+		pos_[block_idx] = order_.begin();
+		data_[block_idx] = std::move(block);
+	}
+
+private:
+	int32_t capacity_;
+	std::list<int32_t> order_; // front = most recently used, back = least recently used
+	std::unordered_map<int32_t, std::list<int32_t>::iterator> pos_;
+	std::unordered_map<int32_t, unique_ptr<DecodedBMBlock>> data_;
+};
+
+// Core BM pair computation, shared by hail_ld_bm_pairs_batch/hail_ld_bm_pairs_batch_stats (via
+// ProcessBMPairsBatch below, which buffers every row into a vector for their own bind-then-scan
+// return) and by hail_ld_materialize (which streams each row straight to a Parquet-bound Appender
+// instead, since buffering all rows across every locus in a large combined request is what caused
+// single-call materializer OOM on real multi-locus data -- see docs/LD-QUERY.md). `emit_row` is
+// called once per computed pair row; it must not assume the row outlives the call.
+// `grouped` is (locus_id -> resolved variants), already in the ascending locus_id order the PRD
+// requires for output; each locus's variants are paired only against each other (never across
+// loci), but every locus in this one call shares a single LRUBlockCache.
+template <class RowSink>
+static void
+ComputeBMPairsBatchCore(ClientContext &context, const std::string &bm_path,
+                        const std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> &grouped,
+                        int32_t max_cached_blocks, BMBatchStats &stats, RowSink &&emit_row) {
+	auto &fs = FileSystem::GetFileSystem(context);
+	auto metadata = LoadBlockMatrixMetadata(fs, bm_path);
+	int64_t n_block_cols = (metadata.n_cols + metadata.block_size - 1) / metadata.block_size;
+
+	std::unordered_map<int32_t, idx_t> block_idx_to_part_pos;
+	for (idx_t i = 0; i < metadata.block_indices.size(); ++i) {
+		block_idx_to_part_pos[metadata.block_indices[i]] = i;
+	}
+
+	LRUBlockCache cache(max_cached_blocks);
+	// "Confirmed missing" blocks aren't decompressed data, so they're memoized separately from the
+	// size-bounded cache rather than competing with real blocks for the eviction budget.
+	std::unordered_set<int32_t> confirmed_missing;
+
+	// Ground-truth-verified against real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data (see
+	// hail_ld_bm_pairs's identically-derived get_cell for the full derivation): the tile is selected
+	// by (row-band = idx_larger's band, col-band = idx_smaller's band), but the array offset WITHIN
+	// that tile holds idx_smaller's own local offset on the row axis and idx_larger's own local
+	// offset on the col axis -- the opposite of what tile selection alone would suggest. Verified
+	// independently for both a diagonal and an off-diagonal real block.
+	auto get_cell = [&](int64_t idx_smaller, int64_t idx_larger, bool &out_missing_block) -> double {
+		int64_t block_row = idx_larger / metadata.block_size;
+		int64_t block_col = idx_smaller / metadata.block_size;
+		int32_t block_idx = static_cast<int32_t>(block_row * n_block_cols + block_col);
+
+		if (confirmed_missing.count(block_idx)) {
+			out_missing_block = true;
+			return 0.0;
+		}
+		DecodedBMBlock *block = cache.Get(block_idx, stats);
+		if (block == nullptr) {
+			auto pos_it = block_idx_to_part_pos.find(block_idx);
+			if (pos_it == block_idx_to_part_pos.end()) {
+				confirmed_missing.insert(block_idx);
+				out_missing_block = true;
+				return 0.0;
+			}
+			std::string part_path = bm_path + "/parts/" + metadata.part_files[pos_it->second];
+			auto handle = fs.OpenFile(part_path, FileFlags::FILE_FLAGS_READ);
+			std::vector<uint8_t> raw = DecompressHailLz4Stream(*handle, part_path);
+			if (raw.size() < 9) {
+				throw IOException("hail_ld_bm_pairs_batch: BlockMatrix block file too small: " + part_path);
+			}
+			size_t cursor = 0;
+			auto read32 = [&]() -> int32_t {
+				int32_t v = static_cast<int32_t>(raw[cursor]) | (static_cast<int32_t>(raw[cursor + 1]) << 8) |
+				            (static_cast<int32_t>(raw[cursor + 2]) << 16) |
+				            (static_cast<int32_t>(raw[cursor + 3]) << 24);
+				cursor += 4;
+				return v;
+			};
+			int32_t stored_rows = read32();
+			int32_t stored_cols = read32();
+			bool is_transpose = (raw[cursor++] != 0);
+			auto bi = ComputeBlockMatrixBlockInfo(block_idx, metadata.block_size, metadata.n_rows, metadata.n_cols);
+			if (stored_rows != bi.block_n_rows || stored_cols != bi.block_n_cols) {
+				throw IOException("hail_ld_bm_pairs_batch: BlockMatrix block dimension mismatch in " + part_path);
+			}
+			int64_t n_elements = static_cast<int64_t>(stored_rows) * stored_cols;
+			size_t data_bytes = static_cast<size_t>(n_elements) * sizeof(double);
+			if (raw.size() - cursor < data_bytes) {
+				throw IOException("hail_ld_bm_pairs_batch: BlockMatrix block file data truncated: " + part_path);
+			}
+			auto decoded = make_uniq<DecodedBMBlock>();
+			decoded->data.resize(n_elements);
+			std::memcpy(decoded->data.data(), raw.data() + cursor, data_bytes);
+			decoded->is_transpose = is_transpose;
+			decoded->block_n_rows = bi.block_n_rows;
+			decoded->block_n_cols = bi.block_n_cols;
+			stats.blocks_opened++;
+			DecodedBMBlock *ptr = decoded.get();
+			cache.Put(block_idx, std::move(decoded), stats);
+			block = ptr;
+		}
+		int64_t array_row = idx_smaller - block_col * metadata.block_size;
+		int64_t array_col = idx_larger - block_row * metadata.block_size;
+		int64_t elem_idx = block->is_transpose ? (array_row * block->block_n_cols + array_col)
+		                                       : (array_col * block->block_n_rows + array_row);
+		return block->data[elem_idx];
+	};
+
+	for (auto &group : grouped) {
+		auto &locus_id = group.first;
+		auto resolved = group.second; // copy: sorted independently per locus, doesn't affect others
+		std::sort(resolved.begin(), resolved.end(),
+		          [](const BMBatchResolvedVariant &a, const BMBatchResolvedVariant &b) { return a.idx < b.idx; });
+
+		for (idx_t a = 0; a < resolved.size(); ++a) {
+			for (idx_t b = a + 1; b < resolved.size(); ++b) {
+				auto &vi = resolved[a];
+				auto &vj = resolved[b];
+				if (vi.idx == vj.idx) {
+					continue; // never emit a diagonal row, even defensively against duplicate input idx
+				}
+				BMBatchPairOutRow out;
+				out.locus_id = locus_id;
+				out.idx_i = vi.idx;
+				out.idx_j = vj.idx;
+				if (vi.idx < 0 || vi.idx >= metadata.n_rows || vj.idx < 0 || vj.idx >= metadata.n_cols) {
+					out.status_code = 2; // bm_index_out_of_bounds
+					emit_row(out);
+					continue;
+				}
+				bool missing_block = false;
+				// out.idx_i < out.idx_j always (resolved is sorted ascending, a < b); get_cell selects
+				// the tile and the within-tile array offset per the ground-truth-verified convention
+				// documented on its definition above.
+				double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
+				if (missing_block) {
+					out.status_code = 3; // bm_missing_block
+				} else if (std::isnan(raw_value)) {
+					out.status_code = 4; // bm_missing_or_nan
+				} else {
+					out.has_r = true;
+					out.r = raw_value * vi.allele_order * vj.allele_order;
+					out.status_code = 0; // bm_resolved
+				}
+				emit_row(out);
+			}
+		}
+	}
+}
+
+// Thin wrapper over ComputeBMPairsBatchCore for hail_ld_bm_pairs_batch/hail_ld_bm_pairs_batch_stats,
+// which need every row returned (buffered) for their own bind-then-scan table function pattern --
+// proven safe at real per-locus scale (up to ~4.9M rows for the largest single locus seen against
+// real PanUKBB data). hail_ld_materialize does NOT use this: it streams rows straight to Parquet
+// instead, since a large combined multi-locus request must not hold every locus's pairs in memory
+// at once (see docs/LD-QUERY.md).
+static BMBatchResult
+ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
+                    const std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> &grouped,
+                    int32_t max_cached_blocks) {
+	BMBatchResult result;
+	ComputeBMPairsBatchCore(context, bm_path, grouped, max_cached_blocks, result.stats,
+	                        [&](const BMBatchPairOutRow &row) { result.rows.push_back(row); });
+	return result;
+}
+
+// Parses the shared (bm_path, resolved, max_cached_blocks) argument shape used by both
+// hail_ld_bm_pairs_batch and hail_ld_bm_pairs_batch_stats.
+static BMBatchResult RunBMPairsBatchFromInput(ClientContext &context, TableFunctionBindInput &input) {
+	if (input.inputs.size() < 2) {
+		return BMBatchResult();
+	}
+	std::string bm_path = input.inputs[0].GetValue<string>();
+
+	// Group by locus_id via std::map so iteration order is ascending locus_id -- exactly the order
+	// the PRD requires LD output to be keyed/ordered by, with no separate sort step needed afterward.
+	std::map<std::string, std::vector<BMBatchResolvedVariant>> grouped_map;
+	for (auto &item : ListValue::GetChildren(input.inputs[1])) {
+		if (item.IsNull()) {
+			continue;
+		}
+		auto &fields = StructValue::GetChildren(item);
+		std::string locus_id = fields[0].GetValue<string>();
+		grouped_map[locus_id].push_back({fields[1].GetValue<int64_t>(), fields[2].GetValue<int32_t>()});
+	}
+	std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> grouped(grouped_map.begin(),
+	                                                                                 grouped_map.end());
+
+	int32_t max_cached_blocks = 64;
+	auto named_it = input.named_parameters.find("max_cached_blocks");
+	if (named_it != input.named_parameters.end()) {
+		max_cached_blocks = named_it->second.GetValue<int32_t>();
+	}
+
+	return ProcessBMPairsBatch(context, bm_path, grouped, max_cached_blocks);
+}
+
+struct HailLDBMPairsBatchBindData : public TableFunctionData {
+	std::vector<BMBatchPairOutRow> rows;
+};
+
+static unique_ptr<FunctionData> HailLDBMPairsBatchBind(ClientContext &context, TableFunctionBindInput &input,
+                                                       vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"locus_id", "idx_i", "idx_j", "r", "bm_status_domain", "bm_status_code"};
+	return_types = {LogicalType::VARCHAR, LogicalType::BIGINT,  LogicalType::BIGINT,
+	                LogicalType::DOUBLE,  LogicalType::VARCHAR, LogicalType::INTEGER};
+	auto bind_data = make_uniq<HailLDBMPairsBatchBindData>();
+	bind_data->rows = RunBMPairsBatchFromInput(context, input).rows;
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDBMPairsBatchInitGlobal(ClientContext &context,
+                                                                         TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct BMPairsBatchLocalState : public LocalTableFunctionState {
+	std::vector<BMBatchPairOutRow> rows;
+	idx_t next = 0;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDBMPairsBatchInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<BMPairsBatchLocalState>();
+	auto &bind = input.bind_data->Cast<HailLDBMPairsBatchBindData>();
+	state->rows = bind.rows;
+	return std::move(state);
+}
+
+static void HailLDBMPairsBatchScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<BMPairsBatchLocalState>();
+	if (local.next >= local.rows.size()) {
+		output.SetCardinality(0);
+		return;
+	}
+	const idx_t capacity = STANDARD_VECTOR_SIZE;
+	idx_t to_emit = std::min<idx_t>(capacity, local.rows.size() - local.next);
+
+	auto &locus_vec = output.data[0];
+	auto &idx_i_vec = output.data[1];
+	auto &idx_j_vec = output.data[2];
+	auto &r_vec = output.data[3];
+	auto &dom_vec = output.data[4];
+	auto &code_vec = output.data[5];
+
+	for (idx_t i = 0; i < to_emit; ++i) {
+		auto &row = local.rows[local.next + i];
+		FlatVector::GetData<string_t>(locus_vec)[i] = StringVector::AddString(locus_vec, row.locus_id);
+		FlatVector::GetData<int64_t>(idx_i_vec)[i] = row.idx_i;
+		FlatVector::GetData<int64_t>(idx_j_vec)[i] = row.idx_j;
+		if (row.has_r) {
+			FlatVector::GetData<double>(r_vec)[i] = row.r;
+		} else {
+			FlatVector::SetNull(r_vec, i, true);
+		}
+		FlatVector::GetData<string_t>(dom_vec)[i] = StringVector::AddString(dom_vec, "bm");
+		FlatVector::GetData<int32_t>(code_vec)[i] = row.status_code;
+	}
+	local.next += to_emit;
+	output.SetCardinality(to_emit);
+}
+
+// hail_ld_bm_pairs_batch_stats: introspection twin of hail_ld_bm_pairs_batch, proving cache reuse
+// and deterministic eviction through observable counters rather than internal state.
+struct BMPairsBatchStatsBindData : public TableFunctionData {
+	BMBatchStats stats;
+};
+
+static unique_ptr<FunctionData> HailLDBMPairsBatchStatsBind(ClientContext &context, TableFunctionBindInput &input,
+                                                            vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"blocks_opened", "cache_hits", "evictions"};
+	return_types = {LogicalType::INTEGER, LogicalType::INTEGER, LogicalType::INTEGER};
+	auto bind_data = make_uniq<BMPairsBatchStatsBindData>();
+	bind_data->stats = RunBMPairsBatchFromInput(context, input).stats;
+	return std::move(bind_data);
+}
+
+struct BMPairsBatchStatsLocalState : public LocalTableFunctionState {
+	BMBatchStats stats;
+	bool emitted = false;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDBMPairsBatchStatsInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	auto state = make_uniq<BMPairsBatchStatsLocalState>();
+	auto &bind = input.bind_data->Cast<BMPairsBatchStatsBindData>();
+	state->stats = bind.stats;
+	return std::move(state);
+}
+
+static void HailLDBMPairsBatchStatsScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &local = data.local_state->Cast<BMPairsBatchStatsLocalState>();
+	if (local.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	FlatVector::GetData<int32_t>(output.data[0])[0] = local.stats.blocks_opened;
+	FlatVector::GetData<int32_t>(output.data[1])[0] = local.stats.cache_hits;
+	FlatVector::GetData<int32_t>(output.data[2])[0] = local.stats.evictions;
+	local.emitted = true;
+	output.SetCardinality(1);
+}
+
+// ---------------------------------------------------------------------------
+// hail_ld_materialize(ht_path, bm_path, requests_path, ld_output_path, status_output_path,
+// max_cached_blocks := 64): the materializer/CLI surface (issue #21). Performs exactly one HT
+// extraction (ResolveHTCore) and exactly one BM extraction (ProcessBMPairsBatch) and writes both
+// user-facing Parquet outputs from that single in-memory pass, so nf-fine-mapping users never see
+// the internal event-stream shape. Doesn't manage S3/httpfs credentials itself -- paths are passed
+// straight through to DuckDB's own FileSystem/httpfs layer exactly like every other path-taking
+// function in this file, so there's no additional surface here that could leak a secret.
+// ---------------------------------------------------------------------------
+
+// Only resolved_exact(0)/resolved_flipped(1) variants participate in BM pairs; everything else
+// (outside_locus/unsupported/multiple_variants_at_position/not_found_in_ht/ambiguous_in_ht) has no
+// HT index to pair with, so it's naturally excluded here without needing its own special case.
+static std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>>
+GroupResolvedForBMBatch(const std::vector<HTResolveOutRow> &ht_rows) {
+	std::map<std::string, std::vector<BMBatchResolvedVariant>> grouped_map;
+	for (auto &r : ht_rows) {
+		if (r.status_code != 0 && r.status_code != 1) {
+			continue;
+		}
+		grouped_map[r.locus_id].push_back({r.idx, r.allele_order});
+	}
+	return std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>>(grouped_map.begin(),
+	                                                                                grouped_map.end());
+}
+
+// Streams rows into a fresh, connection-local TEMP TABLE via a duckdb::Appender (which flushes
+// internally every ~200K rows into buffer-managed, spillable storage instead of raw process heap),
+// then COPYs the table to Parquet in one pass and drops it. Unlike building a full
+// vector<vector<Value>> and calling Connection::Values() on the whole thing at once -- which held
+// several full in-memory copies of every row simultaneously -- this keeps peak process memory
+// bounded regardless of total row count. This is the fix for single-call hail_ld_materialize OOM on
+// large, multi-locus combined requests (see docs/LD-QUERY.md): a real 24-locus/38.5M-pair combined
+// request reliably exhausted memory with the old Values()-based approach, both times reproduced
+// against real PanUKBB S3 data, and completes cleanly with this streaming approach.
+class StreamingParquetSink {
+public:
+	StreamingParquetSink(ClientContext &context, std::string table_name, const vector<string> &column_names,
+	                     const vector<LogicalType> &column_types)
+	    : con_(*context.db), table_name_(std::move(table_name)) {
+		std::string column_defs;
+		for (idx_t i = 0; i < column_names.size(); ++i) {
+			if (i > 0) {
+				column_defs += ", ";
+			}
+			column_defs += KeywordHelper::WriteOptionallyQuoted(column_names[i]) + " " + column_types[i].ToString();
+		}
+		// CREATE OR REPLACE: each sink already uses its own fresh Connection (DuckDB scopes TEMP
+		// tables per-connection, so distinct calls don't actually collide), but this is a costless
+		// hardening against any future path that re-binds/reuses a connection.
+		auto create_result = con_.Query("CREATE OR REPLACE TEMP TABLE " + table_name_ + "(" + column_defs + ")");
+		if (create_result->HasError()) {
+			throw IOException("hail_ld_materialize: failed to create staging table '" + table_name_ +
+			                  "': " + create_result->GetError());
+		}
+		appender_ = make_uniq<Appender>(con_, table_name_);
+	}
+
+	Appender &Rows() {
+		return *appender_;
+	}
+
+	// Closes the appender, writes `path` ordered by `order_by_sql`, and drops the staging table.
+	void Finalize(const std::string &path, const std::string &order_by_sql) {
+		appender_->Close();
+		std::string escaped_path = StringUtil::Replace(path, "'", "''");
+		auto copy_result = con_.Query("COPY (SELECT * FROM " + table_name_ + " ORDER BY " + order_by_sql + ") TO '" +
+		                              escaped_path + "' (FORMAT PARQUET)");
+		if (copy_result->HasError()) {
+			throw IOException("hail_ld_materialize: failed to write '" + path + "': " + copy_result->GetError());
+		}
+		con_.Query("DROP TABLE " + table_name_);
+	}
+
+private:
+	Connection con_;
+	std::string table_name_;
+	unique_ptr<Appender> appender_;
+};
+
+struct HailLDMaterializeBindData : public TableFunctionData {
+	int64_t ld_pairs_written = 0;
+	int64_t status_rows_written = 0;
+};
+
+static unique_ptr<FunctionData> HailLDMaterializeBind(ClientContext &context, TableFunctionBindInput &input,
+                                                      vector<LogicalType> &return_types, vector<string> &names) {
+	names = {"ld_pairs_written", "status_rows_written"};
+	return_types = {LogicalType::BIGINT, LogicalType::BIGINT};
+	auto bind_data = make_uniq<HailLDMaterializeBindData>();
+	if (input.inputs.size() < 5) {
+		return std::move(bind_data);
+	}
+	std::string ht_path = input.inputs[0].GetValue<string>();
+	std::string bm_path = input.inputs[1].GetValue<string>();
+	std::string requests_path = input.inputs[2].GetValue<string>();
+	std::string ld_output_path = input.inputs[3].GetValue<string>();
+	std::string status_output_path = input.inputs[4].GetValue<string>();
+
+	int32_t max_cached_blocks = 64;
+	auto named_it = input.named_parameters.find("max_cached_blocks");
+	if (named_it != input.named_parameters.end()) {
+		max_cached_blocks = named_it->second.GetValue<int32_t>();
+	}
+
+	// One physical HT extraction ...
+	auto ht_rows = ResolveHTCore(context, ht_path, requests_path);
+	auto grouped = GroupResolvedForBMBatch(ht_rows);
+
+	{
+		vector<string> cols = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
+		                       "allele_order", "status_domain",        "status_code"};
+		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
+		                             LogicalType::BIGINT,  LogicalType::INTEGER, LogicalType::VARCHAR,
+		                             LogicalType::INTEGER};
+		StreamingParquetSink sink(context, "hail_ld_materialize_status_tmp", cols, types);
+		auto &appender = sink.Rows();
+		for (auto &r : ht_rows) {
+			appender.BeginRow();
+			appender.Append<const char *>(r.locus_id.c_str());
+			appender.Append<const char *>(r.requested_variant_id.c_str());
+			if (r.has_matched_variant_id) {
+				appender.Append<const char *>(r.matched_variant_id.c_str());
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			if (r.has_idx) {
+				appender.Append<int64_t>(r.idx);
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			if (r.has_allele_order) {
+				appender.Append<int32_t>(r.allele_order);
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			appender.Append<const char *>("variant");
+			appender.Append<int32_t>(r.status_code);
+			appender.EndRow();
+		}
+		sink.Finalize(status_output_path, "locus_id, requested_variant_id");
+		bind_data->status_rows_written = static_cast<int64_t>(ht_rows.size());
+	}
+
+	{
+		// ... and one physical BM extraction, streamed straight to Parquet as each pair is computed --
+		// never buffered as a full vector<BMBatchPairOutRow> across every locus in the request, which
+		// is what let the previous implementation's peak memory grow unboundedly with the total number
+		// of loci/pairs in one combined materialize call. ld_pairs.parquet contains only successful
+		// pairs -- BM failures (missing block, NaN, out of bounds) are diagnostic, not LD output, and
+		// must not pollute downstream matrix construction.
+		vector<string> cols = {"locus_id", "idx_i", "idx_j", "r"};
+		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
+		                             LogicalType::DOUBLE};
+		StreamingParquetSink sink(context, "hail_ld_materialize_pairs_tmp", cols, types);
+		auto &appender = sink.Rows();
+		int64_t ld_pairs_written = 0;
+		BMBatchStats bm_stats;
+		ComputeBMPairsBatchCore(context, bm_path, grouped, max_cached_blocks, bm_stats,
+		                        [&](const BMBatchPairOutRow &row) {
+			                        if (!row.has_r) {
+				                        return;
+			                        }
+			                        appender.BeginRow();
+			                        appender.Append<const char *>(row.locus_id.c_str());
+			                        appender.Append<int64_t>(row.idx_i);
+			                        appender.Append<int64_t>(row.idx_j);
+			                        appender.Append<double>(row.r);
+			                        appender.EndRow();
+			                        ++ld_pairs_written;
+		                        });
+		sink.Finalize(ld_output_path, "locus_id, idx_i, idx_j");
+		bind_data->ld_pairs_written = ld_pairs_written;
+	}
+
+	return std::move(bind_data);
+}
+
+static unique_ptr<GlobalTableFunctionState> HailLDMaterializeInitGlobal(ClientContext &context,
+                                                                        TableFunctionInitInput &input) {
+	return make_uniq<GlobalTableFunctionState>();
+}
+
+struct HailLDMaterializeLocalState : public LocalTableFunctionState {
+	bool emitted = false;
+};
+
+static unique_ptr<LocalTableFunctionState>
+HailLDMaterializeInitLocal(ExecutionContext &context, TableFunctionInitInput &input, GlobalTableFunctionState *) {
+	return make_uniq<HailLDMaterializeLocalState>();
+}
+
+static void HailLDMaterializeScan(ClientContext &context, TableFunctionInput &data, DataChunk &output) {
+	auto &bind_data = data.bind_data->Cast<HailLDMaterializeBindData>();
+	auto &local = data.local_state->Cast<HailLDMaterializeLocalState>();
+	if (local.emitted) {
+		output.SetCardinality(0);
+		return;
+	}
+	FlatVector::GetData<int64_t>(output.data[0])[0] = bind_data.ld_pairs_written;
+	FlatVector::GetData<int64_t>(output.data[1])[0] = bind_data.status_rows_written;
+	local.emitted = true;
+	output.SetCardinality(1);
 }
 
 // Debug table function: emit parsed parts for each token for inspection
@@ -618,6 +1827,51 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 	                            HailLDPreflightRequestsBind, HailLDPreflightInitGlobal,
 	                            HailLDPreflightRequestsInitLocal);
 	loader.RegisterFunction(requests_func);
+
+	// partition-pruning introspection: which HT partitions a locus range would select
+	TableFunction ht_partitions_func("hail_ld_ht_partitions_for_locus", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                                 HailLDHTPartitionsScan, HailLDHTPartitionsBind, HailLDPreflightInitGlobal,
+	                                 HailLDHTPartitionsInitLocal);
+	loader.RegisterFunction(ht_partitions_func);
+
+	// batch HailTable resolver: per-locus direct/flipped matching with partition pruning
+	TableFunction resolve_ht_func("hail_ld_resolve_ht", {LogicalType::VARCHAR, LogicalType::VARCHAR},
+	                              HailLDResolveHTScan, HailLDResolveHTBind, HailLDResolveHTInitGlobal,
+	                              HailLDResolveHTInitLocal);
+	loader.RegisterFunction(resolve_ht_func);
+
+	// BlockMatrix pair extraction: strict canonical pairs among one locus's resolved variants
+	child_list_t<LogicalType> resolved_struct_fields = {{"idx", LogicalType::BIGINT},
+	                                                    {"allele_order", LogicalType::INTEGER}};
+	TableFunction bm_pairs_func("hail_ld_bm_pairs",
+	                            {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::STRUCT(resolved_struct_fields))},
+	                            HailLDBMPairsScan, HailLDBMPairsBind, HailLDBMPairsInitGlobal, HailLDBMPairsInitLocal);
+	loader.RegisterFunction(bm_pairs_func);
+
+	// Multi-locus BlockMatrix pair extraction sharing one query-local decompressed block cache
+	child_list_t<LogicalType> resolved_batch_struct_fields = {
+	    {"locus_id", LogicalType::VARCHAR}, {"idx", LogicalType::BIGINT}, {"allele_order", LogicalType::INTEGER}};
+	LogicalType resolved_batch_list_type = LogicalType::LIST(LogicalType::STRUCT(resolved_batch_struct_fields));
+
+	TableFunction bm_pairs_batch_func("hail_ld_bm_pairs_batch", {LogicalType::VARCHAR, resolved_batch_list_type},
+	                                  HailLDBMPairsBatchScan, HailLDBMPairsBatchBind, HailLDBMPairsBatchInitGlobal,
+	                                  HailLDBMPairsBatchInitLocal);
+	bm_pairs_batch_func.named_parameters["max_cached_blocks"] = LogicalType::INTEGER;
+	loader.RegisterFunction(bm_pairs_batch_func);
+
+	TableFunction bm_pairs_batch_stats_func(
+	    "hail_ld_bm_pairs_batch_stats", {LogicalType::VARCHAR, resolved_batch_list_type}, HailLDBMPairsBatchStatsScan,
+	    HailLDBMPairsBatchStatsBind, HailLDPreflightInitGlobal, HailLDBMPairsBatchStatsInitLocal);
+	bm_pairs_batch_stats_func.named_parameters["max_cached_blocks"] = LogicalType::INTEGER;
+	loader.RegisterFunction(bm_pairs_batch_stats_func);
+
+	// Materializer: one physical HT+BM extraction, writes ld_pairs.parquet + variant_resolution_status.parquet
+	TableFunction materialize_func(
+	    "hail_ld_materialize",
+	    {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR},
+	    HailLDMaterializeScan, HailLDMaterializeBind, HailLDMaterializeInitGlobal, HailLDMaterializeInitLocal);
+	materialize_func.named_parameters["max_cached_blocks"] = LogicalType::INTEGER;
+	loader.RegisterFunction(materialize_func);
 
 	// debug preflight parser inspection function
 	TableFunction debug_func(

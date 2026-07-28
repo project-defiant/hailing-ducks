@@ -1,0 +1,14 @@
+# name: test/sql/hail_blockmatrix_malformed_metadata.test
+# description: LoadBlockMatrixMetadata rejects a maybeFiltered/partFiles length mismatch
+# group: [sql]
+
+require quack
+
+# test/matrix_malformed_maybefiltered.bm/metadata.json declares 2 partFiles but only 1
+# maybeFiltered entry -- these must align 1:1 by position (each partFiles[i] is the physical file
+# for flat block index maybeFiltered[i]), so a length mismatch is a structural error, not
+# something that should silently misalign block->file lookups downstream.
+statement error
+SELECT * FROM hail_scan_blockmatrix('test/matrix_malformed_maybefiltered.bm');
+----
+these must have equal length

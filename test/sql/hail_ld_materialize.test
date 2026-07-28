@@ -1,0 +1,79 @@
+# name: test/sql/hail_ld_materialize.test
+# group: [sql]
+
+require quack
+
+require parquet
+
+# hail_ld_materialize(ht_path, bm_path, requests_path, ld_output_path, status_output_path,
+# max_cached_blocks := 64): the materializer/CLI surface (issue #21). Performs ONE physical HT+BM
+# extraction (ResolveHTCore + ProcessBMPairsBatch, each called exactly once) and writes both
+# user-facing outputs from that single pass: ld_pairs.parquet (successful pairs only) and
+# variant_resolution_status.parquet (one row per unique requested variant, including failures).
+#
+# Fixtures: test/hailtable_fixture_ld.ht + test/matrix_ld.bm (same cross-fixture setup as the
+# hail_ld_resolve_ht/hail_ld_bm_pairs integration tests). locus1 resolves two variants that form one
+# LD pair; locus2's single variant can't resolve (no HT row at that position), so it contributes a
+# status row but no LD pair.
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('locus1', 'chr1:100-500', ['chr1_200_A_G', 'chr1_300_A_G']),
+    ('locus2', 'chr1:600-1000', ['chr1_650_A_T'])
+  ) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_materialize_requests.parquet' (FORMAT PARQUET);
+
+query II
+SELECT ld_pairs_written, status_rows_written
+FROM hail_ld_materialize(
+  'test/hailtable_fixture_ld.ht',
+  'test/matrix_ld.bm',
+  '__TEST_DIR__/hail_ld_materialize_requests.parquet',
+  '__TEST_DIR__/hail_ld_materialize_ld_pairs.parquet',
+  '__TEST_DIR__/hail_ld_materialize_status.parquet'
+);
+----
+1	3
+
+# ld_pairs.parquet contains only the one successful pair, with no BM status columns (success-only,
+# per the PRD: the main LD output must not be polluted with diagnostics).
+query TIIR
+SELECT locus_id, idx_i, idx_j, r FROM '__TEST_DIR__/hail_ld_materialize_ld_pairs.parquet'
+ORDER BY locus_id, idx_i, idx_j;
+----
+locus1	1	2	-30.0
+
+# variant_resolution_status.parquet has one row per unique requested variant, including locus2's
+# not-found failure -- proving the single event stream was split, not independently recomputed.
+query TTTIITI
+SELECT locus_id, requested_variant_id, matched_variant_id, idx, allele_order, status_domain, status_code
+FROM '__TEST_DIR__/hail_ld_materialize_status.parquet'
+ORDER BY locus_id, requested_variant_id;
+----
+locus1	chr1_200_A_G	chr1_200_A_G	1	1	variant	0
+locus1	chr1_300_A_G	chr1_300_G_A	2	-1	variant	1
+locus2	chr1_650_A_T	NULL	NULL	NULL	variant	2
+
+# A request file with no resolvable pairs at all -> ld_pairs.parquet still gets written with the
+# correct schema, just zero rows.
+statement ok
+COPY (
+  SELECT * FROM (VALUES ('locus3', 'chr1:600-1000', ['chr1_650_A_T'])) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_materialize_requests_empty.parquet' (FORMAT PARQUET);
+
+query II
+SELECT ld_pairs_written, status_rows_written
+FROM hail_ld_materialize(
+  'test/hailtable_fixture_ld.ht',
+  'test/matrix_ld.bm',
+  '__TEST_DIR__/hail_ld_materialize_requests_empty.parquet',
+  '__TEST_DIR__/hail_ld_materialize_ld_pairs_empty.parquet',
+  '__TEST_DIR__/hail_ld_materialize_status_empty.parquet'
+);
+----
+0	1
+
+query I
+SELECT COUNT(*) FROM '__TEST_DIR__/hail_ld_materialize_ld_pairs_empty.parquet';
+----
+0

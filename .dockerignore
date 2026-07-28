@@ -1,0 +1,9 @@
+.git
+build
+.venv
+.cache
+duckdb_unittest_tempdir
+.omx
+.idea
+.codex
+.agents

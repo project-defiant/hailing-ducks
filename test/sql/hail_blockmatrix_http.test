@@ -13,7 +13,8 @@ require httpfs
 require-env HTTP_TEST_PORT
 
 # Load httpfs so DuckDB can resolve http:// URIs
-load httpfs
+statement ok
+LOAD httpfs;
 
 # Total element count must match the local-path result
 query I

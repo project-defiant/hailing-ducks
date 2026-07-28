@@ -1,0 +1,112 @@
+# name: test/sql/hail_ld_s3_smoke.test
+# group: [sql]
+
+#              Opt-in smoke test against a real, remote PanUKBB-style HailTable + BlockMatrix over
+#              S3/httpfs (issue #22). Skips cleanly (not a failure) unless both path env vars are set.
+#              Run with: HAILING_DUCKS_S3_HT_PATH=s3://... HAILING_DUCKS_S3_BM_PATH=s3://... make test_s3_smoke
+#              Needs no AWS credentials for the public PanUKBB bucket, e.g.:
+#                HAILING_DUCKS_S3_HT_PATH=s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht
+#                HAILING_DUCKS_S3_BM_PATH=s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm
+#
+#              This test derives its request from real rows read directly out of the configured HT,
+#              rather than hardcoding population-specific variant IDs, so it works against any
+#              PanUKBB-style population's HT/BM pair, not just EUR.
+
+require quack
+
+require httpfs
+
+require parquet
+
+require-env HAILING_DUCKS_S3_HT_PATH
+
+require-env HAILING_DUCKS_S3_BM_PATH
+
+statement ok
+LOAD httpfs;
+
+statement ok
+SET s3_region='us-east-1';
+
+# 1. Direct HT read over S3 (the raw hail_scan_table reader, not the batch-optimized path) -- proves
+# basic remote readability/schema before anything LD-specific is exercised.
+query I
+SELECT COUNT(*) > 0 FROM (SELECT * FROM hail_scan_table('${HAILING_DUCKS_S3_HT_PATH}') LIMIT 10);
+----
+true
+
+# 2. Direct BM read over S3 (the raw hail_scan_blockmatrix reader).
+query I
+SELECT COUNT(*) > 0 FROM (SELECT * FROM hail_scan_blockmatrix('${HAILING_DUCKS_S3_BM_PATH}') LIMIT 10);
+----
+true
+
+# 3. Build a tiny, self-contained request file from 5 real biallelic-SNP rows read directly out of
+# the configured HT (LIMIT stops the scan early -- this does not read the whole remote table).
+statement ok
+CREATE TEMP TABLE sample_rows AS
+SELECT locus.contig AS contig, locus.position AS position, alleles, idx
+FROM hail_scan_table('${HAILING_DUCKS_S3_HT_PATH}')
+WHERE alleles IS NOT NULL AND len(alleles) = 2
+  AND len(alleles[1]) = 1 AND len(alleles[2]) = 1
+  AND alleles[1] IN ('A', 'C', 'G', 'T') AND alleles[2] IN ('A', 'C', 'G', 'T')
+LIMIT 5;
+
+query I
+SELECT COUNT(*) FROM sample_rows;
+----
+5
+
+statement ok
+COPY (
+  SELECT
+    'smoke_locus' AS locus_id,
+    ANY_VALUE(contig) || ':' || MIN(position) || '-' || MAX(position) AS locus,
+    list(contig || '_' || position || '_' || alleles[1] || '_' || alleles[2]) AS variant_ids
+  FROM sample_rows
+) TO '__TEST_DIR__/hail_ld_s3_smoke_requests.parquet' (FORMAT PARQUET);
+
+# 4. hail_ld_resolve_ht against the real remote HT: every one of these 5 variants was just read
+# directly from that same HT, so all 5 MUST resolve as resolved_exact (status_code = 0) -- this is a
+# genuine correctness check (not just "doesn't crash"), and works regardless of which PanUKBB
+# population's HT is configured.
+query I
+SELECT COUNT(*) = 5 AND COUNT(*) FILTER (WHERE status_code != 0) = 0
+FROM hail_ld_resolve_ht('${HAILING_DUCKS_S3_HT_PATH}', '__TEST_DIR__/hail_ld_s3_smoke_requests.parquet');
+----
+true
+
+statement ok
+SET VARIABLE smoke_resolved = (
+  SELECT list({'locus_id': locus_id, 'idx': idx, 'allele_order': allele_order})
+  FROM hail_ld_resolve_ht('${HAILING_DUCKS_S3_HT_PATH}', '__TEST_DIR__/hail_ld_s3_smoke_requests.parquet')
+  WHERE status_code IN (0, 1)
+);
+
+# 5. hail_ld_bm_pairs_batch against the real remote BM: every emitted status code must be one of the
+# documented ones (proving no crash/garbage), and every successfully-resolved r must fall in the
+# valid correlation range -- this is what "confirms BM orientation on real remote blocks or reports a
+# clear actionable failure" (issue #22) means in practice: an addressing bug would either produce an
+# out-of-range value here or (as found and fixed during this issue's own investigation) leave
+# everything unresolved. The authoritative correctness proof is the exact match against an
+# independent Hail-computed LD reference recorded in issue #19/#21's follow-up notes; this smoke test
+# is the lightweight, any-environment-runnable regression check on top of that.
+query I
+SELECT
+  COUNT(*) FILTER (WHERE bm_status_code NOT IN (0, 2, 3, 4)) = 0
+  AND COUNT(*) FILTER (WHERE bm_status_code = 0 AND (r < -1.0001 OR r > 1.0001)) = 0
+FROM hail_ld_bm_pairs_batch('${HAILING_DUCKS_S3_BM_PATH}', getvariable('smoke_resolved'));
+----
+true
+
+# 6. hail_ld_materialize end-to-end: one physical HT+BM extraction, both outputs written.
+query II
+SELECT status_rows_written = 5, ld_pairs_written >= 0
+FROM hail_ld_materialize(
+  '${HAILING_DUCKS_S3_HT_PATH}', '${HAILING_DUCKS_S3_BM_PATH}',
+  '__TEST_DIR__/hail_ld_s3_smoke_requests.parquet',
+  '__TEST_DIR__/hail_ld_s3_smoke_ld_pairs.parquet',
+  '__TEST_DIR__/hail_ld_s3_smoke_status.parquet'
+);
+----
+true	true

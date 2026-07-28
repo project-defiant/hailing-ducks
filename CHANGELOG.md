@@ -59,6 +59,65 @@ All notable changes to this project will be documented in this file.
 - **`test/sql/hail_codec.test`**: SQLLogicTest suite covering frame metadata,
   LEB128 u32/u64 round-trips (including boundary values such as `UINT32_MAX` and
   `UINT64_MAX`), and EOF behaviour
+- **Batch-optimized LD query pipeline** (`src/hail_ld_query.hpp` /
+  `src/hail_ld_query.cpp`, see `docs/LD-QUERY.md` for the full reference): a
+  separate, purpose-built path — distinct from the raw `hail_scan_table`/
+  `hail_scan_blockmatrix` readers above — for resolving a fine-mapping locus's
+  requested variants against a real HailTable and extracting exactly the LD
+  pairs among them from a real BlockMatrix, without scanning either file in
+  full.
+  - `hail_ld_preflight_requests(requests_path)` / `hail_ld_preflight(locus_str)`:
+    request-file structural validation (dedup, outside-locus, conflicting
+    same-position variants) against the compact status-code schema.
+  - `hail_ld_resolve_ht(ht_path, requests_path)`: locus-pruned HailTable
+    resolution with direct + flipped allele-id set matching, using each
+    table's real `_key`/`_jRangeBounds` partitioner metadata to prune
+    partitions instead of scanning the whole table.
+  - `hail_ld_bm_pairs(bm_path, resolved)` / `hail_ld_bm_pairs_batch(bm_path,
+    resolved, max_cached_blocks := 64)`: BlockMatrix pair extraction with a
+    shared, capacity-bounded LRU block cache reused across loci in the
+    `_batch` variant, canonicalizing every lookup to the real (lower-triangle)
+    storage orientation verified against production PanUKBB S3 data.
+  - `hail_ld_materialize(ht_path, bm_path, requests_path, ld_output_path,
+    status_output_path, max_cached_blocks := 64)`: one physical HT+BM pass
+    that writes `ld_pairs.parquet` (successful pairs only) and
+    `variant_resolution_status.parquet` (one row per unique requested
+    variant, including failures), streaming both outputs directly to Parquet
+    via a `duckdb::Appender`-backed staging table so peak memory stays
+    bounded regardless of how many loci/pairs one combined request contains.
+  - `hail_ld_status_codes()`: lookup table for the compact integer status
+    codes (`resolved_exact`, `resolved_flipped`, `not_found_in_ht`,
+    `outside_locus`, `ambiguous_in_ht`, `unsupported_variant_id`,
+    `multiple_variants_at_position`, plus the BM-side `bm_resolved`/
+    `bm_missing_from_ht`/`bm_index_out_of_bounds`/`bm_missing_block`/
+    `bm_missing_or_nan` codes).
+  - `hail_ld_ht_partitions_for_locus(...)` / `hail_ld_bm_pairs_batch_stats(...)`:
+    introspection helpers proving partition-pruning and block-cache-reuse
+    behavior through observable SQL output rather than internal state.
+  - `make test_s3_smoke`: opt-in SQLLogicTest run against real PanUKBB HT/BM
+    data over S3/httpfs; skips cleanly without network access.
+- **Docker image** (`Dockerfile`): multi-stage build producing a runtime image with the DuckDB CLI
+  and both the `quack` and `httpfs` extensions already built in (no `INSTALL`/`LOAD` needed).
+  Published to `ghcr.io/project-defiant/hailing-ducks` as a multi-arch (`linux/amd64` +
+  `linux/arm64`) image by `.github/workflows/docker-release-image.yml`, which runs only on tag
+  pushes and tags the image with the pushed tag's name plus `latest`.
+
+### Fixed
+
+- `hail_ld_materialize` no longer buffers its full result set as in-memory
+  `Value`s before writing Parquet — a real combined multi-locus request (24
+  loci / 38.5M LD pairs in one call) reliably exhausted process memory with
+  the old approach. Rows are now streamed straight to Parquet via a
+  `duckdb::Appender`-backed staging table, so peak memory no longer scales
+  with the total number of loci/pairs in one request.
+- BlockMatrix pair extraction (`hail_ld_bm_pairs`/`_batch`/`_materialize`) now
+  canonicalizes lookups to the real, verified-against-production-data
+  **lower**-triangle storage orientation (both the tile selection and the
+  within-tile array offset) — earlier revisions assumed upper-triangle
+  storage, which does not match real PanUKBB data.
+- `ResolveHTCore` no longer crashes on a HailTable row with a genuinely NULL
+  `locus` field (e.g. a failed-liftover row), which the real Hail wire format
+  allows.
 
 ### Known gaps
 
@@ -66,3 +125,6 @@ All notable changes to this project will be documented in this file.
   `ZstdBlockBufferSpec`, `LZ4HCBlockBufferSpec`, and `LZ4FastBlockBufferSpec`.
 - `hail_scan_table` reads the row component only. Hail globals and key-index
   structures are ignored because full sequential scans do not need them.
+- The LD query pipeline does not perform contig/allele normalization,
+  liftover, or multi-allelic variant resolution; see
+  `docs/LD-QUERY.md`'s Policies section for the full, deliberate scope.

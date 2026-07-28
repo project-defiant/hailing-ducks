@@ -1,0 +1,47 @@
+# name: test/sql/hail_ld_resolve_ht.test
+# group: [sql]
+
+require quack
+
+require parquet
+
+# hail_ld_resolve_ht(ht_path, requests_path): resolves preflight candidates against a real HailTable
+# using per-locus direct/flipped allele sets and partition pruning (test/hailtable_fixture_ld.ht).
+# Covers: exact match, flipped match, not-found, multi-allelic non-coercion, unsupported passthrough,
+# multiple_variants_at_position passthrough, outside_locus passthrough, and a second contig.
+statement ok
+COPY (
+  SELECT * FROM (VALUES
+    ('locus1', 'chr1:100-500', [
+      'chr1_200_A_G',   -- exact match: HT idx=1 alleles=[A,G]
+      'chr1_300_A_G',   -- flipped match: HT idx=2 alleles=[G,A]
+      'chr1_400_A_G',   -- collides with a 3-allele HT row (idx=3): must not be coerced -> not_found_in_ht
+      'chr1_250_XY_G',  -- unsupported_variant_id (preflight-level, never reaches HT)
+      'chr1_450_A_G', 'chr1_450_G_C',  -- multiple_variants_at_position (preflight-level)
+      'chr1_999_A_T'    -- outside_locus (preflight-level, locus range ends at 500)
+    ]),
+    ('locus2', 'chr1:600-1000', [
+      'chr1_650_A_T',   -- no HT row at this position -> not_found_in_ht
+      'chr1_800_A_C'    -- HT has both idx=5 [A,C] and idx=6 [C,A] at this position -> ambiguous_in_ht
+    ]),
+    ('locus3', 'chr2:100-500', [
+      'chr2_200_A_G'    -- exact match: HT idx=7 alleles=[A,G]
+    ])
+  ) AS t(locus_id, locus, variant_ids)
+) TO '__TEST_DIR__/hail_ld_resolve_ht_requests.parquet' (FORMAT PARQUET);
+
+query TTTIITI
+SELECT locus_id, requested_variant_id, matched_variant_id, idx, allele_order, status_domain, status_code
+FROM hail_ld_resolve_ht('test/hailtable_fixture_ld.ht', '__TEST_DIR__/hail_ld_resolve_ht_requests.parquet')
+ORDER BY locus_id, requested_variant_id;
+----
+locus1	chr1_200_A_G	chr1_200_A_G	1	1	variant	0
+locus1	chr1_250_XY_G	NULL	NULL	NULL	variant	5
+locus1	chr1_300_A_G	chr1_300_G_A	2	-1	variant	1
+locus1	chr1_400_A_G	NULL	NULL	NULL	variant	2
+locus1	chr1_450_A_G	NULL	NULL	NULL	variant	6
+locus1	chr1_450_G_C	NULL	NULL	NULL	variant	6
+locus1	chr1_999_A_T	NULL	NULL	NULL	variant	3
+locus2	chr1_650_A_T	NULL	NULL	NULL	variant	2
+locus2	chr1_800_A_C	NULL	NULL	NULL	variant	4
+locus3	chr2_200_A_G	chr2_200_A_G	7	1	variant	0
