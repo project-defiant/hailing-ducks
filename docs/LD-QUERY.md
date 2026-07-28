@@ -55,7 +55,12 @@ request file (Parquet)              real HailTable (.ht)         real BlockMatri
   block cache across loci in the `_batch` variant.
 - **`hail_ld_materialize(ht_path, bm_path, requests_path, ld_output_path, status_output_path,
   max_cached_blocks := 64)`** — the materializer/CLI surface (issue #21). Performs the HT resolution
-  and BM extraction exactly once each and writes both user-facing outputs from that single pass.
+  and BM extraction exactly once each and writes both user-facing outputs from that single pass,
+  streaming rows straight to Parquet via a `duckdb::Appender`-backed staging table rather than
+  buffering the full result set as in-memory `Value`s, so peak memory stays bounded regardless of how
+  many loci/pairs a single combined request contains (verified against a real 24-locus/38.5M-pair
+  combined PanUKBB request, which reliably exhausted memory before this fix and now completes cleanly
+  with a peak RSS around 10GB).
 - **`hail_ld_ht_partitions_for_locus(ht_path, locus_range)`** / **`hail_ld_bm_pairs_batch_stats(...)`**
   — introspection helpers proving partition-pruning and block-cache-reuse behavior through
   observable SQL output rather than internal state. Not part of the production pipeline.

@@ -10,7 +10,7 @@
 #include "duckdb/common/string_util.hpp"
 #include "duckdb/common/constants.hpp"
 #include "duckdb/common/file_system.hpp"
-#include "duckdb/main/relation.hpp"
+#include "duckdb/main/appender.hpp"
 
 #include <nlohmann/json.hpp>
 #include <cstdio>
@@ -1162,15 +1162,20 @@ private:
 	std::unordered_map<int32_t, unique_ptr<DecodedBMBlock>> data_;
 };
 
-// Shared by hail_ld_bm_pairs_batch and hail_ld_bm_pairs_batch_stats so the two never diverge:
+// Core BM pair computation, shared by hail_ld_bm_pairs_batch/hail_ld_bm_pairs_batch_stats (via
+// ProcessBMPairsBatch below, which buffers every row into a vector for their own bind-then-scan
+// return) and by hail_ld_materialize (which streams each row straight to a Parquet-bound Appender
+// instead, since buffering all rows across every locus in a large combined request is what caused
+// single-call materializer OOM on real multi-locus data -- see docs/LD-QUERY.md). `emit_row` is
+// called once per computed pair row; it must not assume the row outlives the call.
 // `grouped` is (locus_id -> resolved variants), already in the ascending locus_id order the PRD
 // requires for output; each locus's variants are paired only against each other (never across
 // loci), but every locus in this one call shares a single LRUBlockCache.
-static BMBatchResult
-ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
-                    const std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> &grouped,
-                    int32_t max_cached_blocks) {
-	BMBatchResult result;
+template <class RowSink>
+static void
+ComputeBMPairsBatchCore(ClientContext &context, const std::string &bm_path,
+                        const std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> &grouped,
+                        int32_t max_cached_blocks, BMBatchStats &stats, RowSink &&emit_row) {
 	auto &fs = FileSystem::GetFileSystem(context);
 	auto metadata = LoadBlockMatrixMetadata(fs, bm_path);
 	int64_t n_block_cols = (metadata.n_cols + metadata.block_size - 1) / metadata.block_size;
@@ -1200,7 +1205,7 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 			out_missing_block = true;
 			return 0.0;
 		}
-		DecodedBMBlock *block = cache.Get(block_idx, result.stats);
+		DecodedBMBlock *block = cache.Get(block_idx, stats);
 		if (block == nullptr) {
 			auto pos_it = block_idx_to_part_pos.find(block_idx);
 			if (pos_it == block_idx_to_part_pos.end()) {
@@ -1240,9 +1245,9 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 			decoded->is_transpose = is_transpose;
 			decoded->block_n_rows = bi.block_n_rows;
 			decoded->block_n_cols = bi.block_n_cols;
-			result.stats.blocks_opened++;
+			stats.blocks_opened++;
 			DecodedBMBlock *ptr = decoded.get();
-			cache.Put(block_idx, std::move(decoded), result.stats);
+			cache.Put(block_idx, std::move(decoded), stats);
 			block = ptr;
 		}
 		int64_t array_row = idx_smaller - block_col * metadata.block_size;
@@ -1271,7 +1276,7 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 				out.idx_j = vj.idx;
 				if (vi.idx < 0 || vi.idx >= metadata.n_rows || vj.idx < 0 || vj.idx >= metadata.n_cols) {
 					out.status_code = 2; // bm_index_out_of_bounds
-					result.rows.push_back(out);
+					emit_row(out);
 					continue;
 				}
 				bool missing_block = false;
@@ -1288,11 +1293,25 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 					out.r = raw_value * vi.allele_order * vj.allele_order;
 					out.status_code = 0; // bm_resolved
 				}
-				result.rows.push_back(out);
+				emit_row(out);
 			}
 		}
 	}
+}
 
+// Thin wrapper over ComputeBMPairsBatchCore for hail_ld_bm_pairs_batch/hail_ld_bm_pairs_batch_stats,
+// which need every row returned (buffered) for their own bind-then-scan table function pattern --
+// proven safe at real per-locus scale (up to ~4.9M rows for the largest single locus seen against
+// real PanUKBB data). hail_ld_materialize does NOT use this: it streams rows straight to Parquet
+// instead, since a large combined multi-locus request must not hold every locus's pairs in memory
+// at once (see docs/LD-QUERY.md).
+static BMBatchResult
+ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
+                    const std::vector<std::pair<std::string, std::vector<BMBatchResolvedVariant>>> &grouped,
+                    int32_t max_cached_blocks) {
+	BMBatchResult result;
+	ComputeBMPairsBatchCore(context, bm_path, grouped, max_cached_blocks, result.stats,
+	                        [&](const BMBatchPairOutRow &row) { result.rows.push_back(row); });
 	return result;
 }
 
@@ -1459,29 +1478,56 @@ GroupResolvedForBMBatch(const std::vector<HTResolveOutRow> &ht_rows) {
 	                                                                                grouped_map.end());
 }
 
-// Writes `rows` to a Parquet file at `path` with the given column names/types, using DuckDB's own
-// Relation/Value APIs (no hand-built SQL string, so no string-escaping/injection concerns for
-// locus_id/variant-id values). A relation can't be built from zero rows without explicit types, so
-// the empty case goes through a tiny always-empty typed SELECT instead.
-static void WriteRowsToParquet(ClientContext &context, const std::string &path, const vector<string> &column_names,
-                               const vector<LogicalType> &column_types, const vector<vector<Value>> &rows) {
-	Connection con(*context.db);
-	shared_ptr<Relation> relation;
-	if (rows.empty()) {
-		std::string select_list;
+// Streams rows into a fresh, connection-local TEMP TABLE via a duckdb::Appender (which flushes
+// internally every ~200K rows into buffer-managed, spillable storage instead of raw process heap),
+// then COPYs the table to Parquet in one pass and drops it. Unlike building a full
+// vector<vector<Value>> and calling Connection::Values() on the whole thing at once -- which held
+// several full in-memory copies of every row simultaneously -- this keeps peak process memory
+// bounded regardless of total row count. This is the fix for single-call hail_ld_materialize OOM on
+// large, multi-locus combined requests (see docs/LD-QUERY.md): a real 24-locus/38.5M-pair combined
+// request reliably exhausted memory with the old Values()-based approach, both times reproduced
+// against real PanUKBB S3 data, and completes cleanly with this streaming approach.
+class StreamingParquetSink {
+public:
+	StreamingParquetSink(ClientContext &context, std::string table_name, const vector<string> &column_names,
+	                     const vector<LogicalType> &column_types)
+	    : con_(*context.db), table_name_(std::move(table_name)) {
+		std::string column_defs;
 		for (idx_t i = 0; i < column_names.size(); ++i) {
 			if (i > 0) {
-				select_list += ", ";
+				column_defs += ", ";
 			}
-			select_list += "CAST(NULL AS " + column_types[i].ToString() + ") AS " +
-			               KeywordHelper::WriteOptionallyQuoted(column_names[i]);
+			column_defs += KeywordHelper::WriteOptionallyQuoted(column_names[i]) + " " + column_types[i].ToString();
 		}
-		relation = con.RelationFromQuery("SELECT " + select_list + " WHERE FALSE");
-	} else {
-		relation = con.Values(rows, column_names);
+		auto create_result = con_.Query("CREATE TEMP TABLE " + table_name_ + "(" + column_defs + ")");
+		if (create_result->HasError()) {
+			throw IOException("hail_ld_materialize: failed to create staging table '" + table_name_ +
+			                  "': " + create_result->GetError());
+		}
+		appender_ = make_uniq<Appender>(con_, table_name_);
 	}
-	relation->WriteParquet(path);
-}
+
+	Appender &Rows() {
+		return *appender_;
+	}
+
+	// Closes the appender, writes `path` ordered by `order_by_sql`, and drops the staging table.
+	void Finalize(const std::string &path, const std::string &order_by_sql) {
+		appender_->Close();
+		std::string escaped_path = StringUtil::Replace(path, "'", "''");
+		auto copy_result = con_.Query("COPY (SELECT * FROM " + table_name_ + " ORDER BY " + order_by_sql + ") TO '" +
+		                              escaped_path + "' (FORMAT PARQUET)");
+		if (copy_result->HasError()) {
+			throw IOException("hail_ld_materialize: failed to write '" + path + "': " + copy_result->GetError());
+		}
+		con_.Query("DROP TABLE " + table_name_);
+	}
+
+private:
+	Connection con_;
+	std::string table_name_;
+	unique_ptr<Appender> appender_;
+};
 
 struct HailLDMaterializeBindData : public TableFunctionData {
 	int64_t ld_pairs_written = 0;
@@ -1510,10 +1556,7 @@ static unique_ptr<FunctionData> HailLDMaterializeBind(ClientContext &context, Ta
 
 	// One physical HT extraction ...
 	auto ht_rows = ResolveHTCore(context, ht_path, requests_path);
-
-	// ... and one physical BM extraction, both feeding both outputs below.
 	auto grouped = GroupResolvedForBMBatch(ht_rows);
-	auto bm_result = ProcessBMPairsBatch(context, bm_path, grouped, max_cached_blocks);
 
 	{
 		vector<string> cols = {"locus_id",     "requested_variant_id", "matched_variant_id", "idx",
@@ -1521,37 +1564,64 @@ static unique_ptr<FunctionData> HailLDMaterializeBind(ClientContext &context, Ta
 		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::VARCHAR, LogicalType::VARCHAR,
 		                             LogicalType::BIGINT,  LogicalType::INTEGER, LogicalType::VARCHAR,
 		                             LogicalType::INTEGER};
-		vector<vector<Value>> status_rows;
+		StreamingParquetSink sink(context, "hail_ld_materialize_status_tmp", cols, types);
+		auto &appender = sink.Rows();
 		for (auto &r : ht_rows) {
-			status_rows.push_back({
-			    Value(r.locus_id),
-			    Value(r.requested_variant_id),
-			    r.has_matched_variant_id ? Value(r.matched_variant_id) : Value(LogicalType::VARCHAR),
-			    r.has_idx ? Value::BIGINT(r.idx) : Value(LogicalType::BIGINT),
-			    r.has_allele_order ? Value::INTEGER(r.allele_order) : Value(LogicalType::INTEGER),
-			    Value(std::string("variant")),
-			    Value::INTEGER(r.status_code),
-			});
+			appender.BeginRow();
+			appender.Append<const char *>(r.locus_id.c_str());
+			appender.Append<const char *>(r.requested_variant_id.c_str());
+			if (r.has_matched_variant_id) {
+				appender.Append<const char *>(r.matched_variant_id.c_str());
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			if (r.has_idx) {
+				appender.Append<int64_t>(r.idx);
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			if (r.has_allele_order) {
+				appender.Append<int32_t>(r.allele_order);
+			} else {
+				appender.Append<std::nullptr_t>(nullptr);
+			}
+			appender.Append<const char *>("variant");
+			appender.Append<int32_t>(r.status_code);
+			appender.EndRow();
 		}
-		WriteRowsToParquet(context, status_output_path, cols, types, status_rows);
-		bind_data->status_rows_written = static_cast<int64_t>(status_rows.size());
+		sink.Finalize(status_output_path, "locus_id, requested_variant_id");
+		bind_data->status_rows_written = static_cast<int64_t>(ht_rows.size());
 	}
 
 	{
+		// ... and one physical BM extraction, streamed straight to Parquet as each pair is computed --
+		// never buffered as a full vector<BMBatchPairOutRow> across every locus in the request, which
+		// is what let the previous implementation's peak memory grow unboundedly with the total number
+		// of loci/pairs in one combined materialize call. ld_pairs.parquet contains only successful
+		// pairs -- BM failures (missing block, NaN, out of bounds) are diagnostic, not LD output, and
+		// must not pollute downstream matrix construction.
 		vector<string> cols = {"locus_id", "idx_i", "idx_j", "r"};
 		vector<LogicalType> types = {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
 		                             LogicalType::DOUBLE};
-		vector<vector<Value>> ld_rows;
-		// ld_pairs.parquet contains only successful pairs -- BM failures (missing block, NaN, out of
-		// bounds) are diagnostic, not LD output, and must not pollute downstream matrix construction.
-		for (auto &r : bm_result.rows) {
-			if (!r.has_r) {
-				continue;
-			}
-			ld_rows.push_back({Value(r.locus_id), Value::BIGINT(r.idx_i), Value::BIGINT(r.idx_j), Value::DOUBLE(r.r)});
-		}
-		WriteRowsToParquet(context, ld_output_path, cols, types, ld_rows);
-		bind_data->ld_pairs_written = static_cast<int64_t>(ld_rows.size());
+		StreamingParquetSink sink(context, "hail_ld_materialize_pairs_tmp", cols, types);
+		auto &appender = sink.Rows();
+		int64_t ld_pairs_written = 0;
+		BMBatchStats bm_stats;
+		ComputeBMPairsBatchCore(context, bm_path, grouped, max_cached_blocks, bm_stats,
+		                        [&](const BMBatchPairOutRow &row) {
+			                        if (!row.has_r) {
+				                        return;
+			                        }
+			                        appender.BeginRow();
+			                        appender.Append<const char *>(row.locus_id.c_str());
+			                        appender.Append<int64_t>(row.idx_i);
+			                        appender.Append<int64_t>(row.idx_j);
+			                        appender.Append<double>(row.r);
+			                        appender.EndRow();
+			                        ++ld_pairs_written;
+		                        });
+		sink.Finalize(ld_output_path, "locus_id, idx_i, idx_j");
+		bind_data->ld_pairs_written = ld_pairs_written;
 	}
 
 	return std::move(bind_data);
