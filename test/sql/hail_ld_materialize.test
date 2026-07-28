@@ -41,7 +41,7 @@ query TIIR
 SELECT locus_id, idx_i, idx_j, r FROM '__TEST_DIR__/hail_ld_materialize_ld_pairs.parquet'
 ORDER BY locus_id, idx_i, idx_j;
 ----
-locus1	1	2	-21.0
+locus1	1	2	-30.0
 
 # variant_resolution_status.parquet has one row per unique requested variant, including locus2's
 # not-found failure -- proving the single event stream was split, not independently recomputed.

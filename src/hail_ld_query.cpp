@@ -929,11 +929,23 @@ static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableF
 	std::unordered_map<int32_t, unique_ptr<DecodedBlock>> block_cache;
 	std::unordered_set<int32_t> confirmed_missing;
 
-	// Returns the raw (uncorrected) cell value at (row, col); sets out_missing_block when the block
-	// containing this cell has no physical part file (Hail's `maybeFiltered` sparse storage).
-	auto get_cell = [&](int64_t row, int64_t col, bool &out_missing_block) -> double {
-		int64_t block_row = row / metadata.block_size;
-		int64_t block_col = col / metadata.block_size;
+	// Returns the raw (uncorrected) cell value for the pair (idx_smaller, idx_larger); sets
+	// out_missing_block when the tile containing this cell has no physical part file (Hail's
+	// `maybeFiltered` sparse storage).
+	//
+	// Ground-truth-verified against real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data
+	// (fetched and manually LZ4-decoded two specific blocks -- one diagonal, one off-diagonal -- and
+	// compared against real LD values from an independent Hail-computed reference): the tile to open
+	// is selected by (row-band = idx_larger's band, col-band = idx_smaller's band) as established
+	// earlier, but the array offset WITHIN that tile is the opposite of what tile selection might
+	// suggest -- the array's row axis holds idx_smaller's own local offset (relative to its own
+	// band) and the col axis holds idx_larger's own local offset, regardless of which one determined
+	// the tile's row-band vs col-band identity. This holds for diagonal tiles (where both indices
+	// share one band, and the "row=smaller/col=larger" placement is the only new information) and
+	// off-diagonal tiles alike (verified independently for both).
+	auto get_cell = [&](int64_t idx_smaller, int64_t idx_larger, bool &out_missing_block) -> double {
+		int64_t block_row = idx_larger / metadata.block_size;
+		int64_t block_col = idx_smaller / metadata.block_size;
 		int32_t block_idx = static_cast<int32_t>(block_row * n_block_cols + block_col);
 
 		if (confirmed_missing.count(block_idx)) {
@@ -983,10 +995,10 @@ static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableF
 			cache_it = block_cache.emplace(block_idx, std::move(block)).first;
 		}
 		auto &block = *cache_it->second;
-		int64_t local_row = row - block_row * metadata.block_size;
-		int64_t local_col = col - block_col * metadata.block_size;
-		int64_t elem_idx = block.is_transpose ? (local_row * block.block_n_cols + local_col)
-		                                      : (local_col * block.block_n_rows + local_row);
+		int64_t array_row = idx_smaller - block_col * metadata.block_size;
+		int64_t array_col = idx_larger - block_row * metadata.block_size;
+		int64_t elem_idx = block.is_transpose ? (array_row * block.block_n_cols + array_col)
+		                                      : (array_col * block.block_n_rows + array_row);
 		return block.data[elem_idx];
 	};
 
@@ -1006,12 +1018,10 @@ static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableF
 				continue;
 			}
 			bool missing_block = false;
-			// Real PanUKBB BlockMatrix storage is LOWER-triangle-inclusive (row_idx >= col_idx) --
-			// confirmed against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm's metadata.json,
-			// where every stored block index satisfies block_row >= block_col across its full range.
-			// So the larger canonical index (idx_j) addresses the row, the smaller (idx_i) the
-			// column; idx_i/idx_j in the OUTPUT are unaffected, only the internal cell address swaps.
-			double raw_value = get_cell(out.idx_j, out.idx_i, missing_block);
+			// out.idx_i < out.idx_j always (resolved is sorted ascending, a < b); get_cell selects
+			// the tile and the within-tile array offset per the ground-truth-verified convention
+			// documented on its definition above.
+			double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
 			if (missing_block) {
 				out.status_code = 3; // bm_missing_block
 			} else if (std::isnan(raw_value)) {
@@ -1175,9 +1185,15 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 	// size-bounded cache rather than competing with real blocks for the eviction budget.
 	std::unordered_set<int32_t> confirmed_missing;
 
-	auto get_cell = [&](int64_t row, int64_t col, bool &out_missing_block) -> double {
-		int64_t block_row = row / metadata.block_size;
-		int64_t block_col = col / metadata.block_size;
+	// Ground-truth-verified against real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data (see
+	// hail_ld_bm_pairs's identically-derived get_cell for the full derivation): the tile is selected
+	// by (row-band = idx_larger's band, col-band = idx_smaller's band), but the array offset WITHIN
+	// that tile holds idx_smaller's own local offset on the row axis and idx_larger's own local
+	// offset on the col axis -- the opposite of what tile selection alone would suggest. Verified
+	// independently for both a diagonal and an off-diagonal real block.
+	auto get_cell = [&](int64_t idx_smaller, int64_t idx_larger, bool &out_missing_block) -> double {
+		int64_t block_row = idx_larger / metadata.block_size;
+		int64_t block_col = idx_smaller / metadata.block_size;
 		int32_t block_idx = static_cast<int32_t>(block_row * n_block_cols + block_col);
 
 		if (confirmed_missing.count(block_idx)) {
@@ -1229,10 +1245,10 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 			cache.Put(block_idx, std::move(decoded), result.stats);
 			block = ptr;
 		}
-		int64_t local_row = row - block_row * metadata.block_size;
-		int64_t local_col = col - block_col * metadata.block_size;
-		int64_t elem_idx = block->is_transpose ? (local_row * block->block_n_cols + local_col)
-		                                       : (local_col * block->block_n_rows + local_row);
+		int64_t array_row = idx_smaller - block_col * metadata.block_size;
+		int64_t array_col = idx_larger - block_row * metadata.block_size;
+		int64_t elem_idx = block->is_transpose ? (array_row * block->block_n_cols + array_col)
+		                                       : (array_col * block->block_n_rows + array_row);
 		return block->data[elem_idx];
 	};
 
@@ -1259,12 +1275,10 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 					continue;
 				}
 				bool missing_block = false;
-				// Real PanUKBB BlockMatrix storage is LOWER-triangle-inclusive (row_idx >= col_idx) --
-				// confirmed against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm's metadata.json,
-				// where every stored block index satisfies block_row >= block_col across its full
-				// range. So the larger canonical index (idx_j) addresses the row, the smaller (idx_i)
-				// the column; idx_i/idx_j in the OUTPUT are unaffected, only the cell address swaps.
-				double raw_value = get_cell(out.idx_j, out.idx_i, missing_block);
+				// out.idx_i < out.idx_j always (resolved is sorted ascending, a < b); get_cell selects
+				// the tile and the within-tile array offset per the ground-truth-verified convention
+				// documented on its definition above.
+				double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
 				if (missing_block) {
 					out.status_code = 3; // bm_missing_block
 				} else if (std::isnan(raw_value)) {

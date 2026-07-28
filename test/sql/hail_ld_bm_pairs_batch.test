@@ -8,7 +8,7 @@ require quack
 # within each locus (never across loci), but all loci in one call share ONE query-local decompressed
 # block cache, so overlapping loci reuse blocks instead of re-fetching them.
 #
-# Fixture test/matrix_ld.bm (see hail_ld_bm_pairs.test): blockSize=2, lower-triangle-only storage.
+# Fixture test/matrix_ld.bm (see hail_ld_bm_pairs.test for the tile-selection/array-offset convention).
 # Loci A and B both request the pair (0,1), which lives entirely in block 0 -- proving block reuse
 # across loci, while their different allele_order combinations prove per-locus sign correction stays
 # isolated even though the block is shared. Locus C requests pair (2,3), which lives in block 4 (a
@@ -25,9 +25,9 @@ FROM hail_ld_bm_pairs_batch('test/matrix_ld.bm', [
 ])
 ORDER BY locus_id, idx_i, idx_j;
 ----
-A	0	1	-10.0	bm	0
-B	0	1	10.0	bm	0
-C	2	3	32.0	bm	0
+A	0	1	-1.0	bm	0
+B	0	1	1.0	bm	0
+C	2	3	23.0	bm	0
 
 # hail_ld_bm_pairs_batch_stats reports the same shared-cache behavior as observable counters (proving
 # "reuse across overlapping loci" and "deterministic eviction" through SQL output, not internal
@@ -74,7 +74,7 @@ FROM hail_ld_bm_pairs_batch('test/matrix_ld.bm', [
 ORDER BY locus_id, idx_i, idx_j;
 ----
 D	0	4	NULL	bm	3
-E	0	1	10.0	bm	0
+E	0	1	1.0	bm	0
 
 # Empty resolved list -> zero rows.
 query I

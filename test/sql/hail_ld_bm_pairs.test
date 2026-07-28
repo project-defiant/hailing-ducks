@@ -4,16 +4,21 @@
 require quack
 
 # hail_ld_bm_pairs(bm_path, resolved): generates strict canonical off-diagonal pairs (idx_i < idx_j)
-# among already-HT-resolved (idx, allele_order) variants for one locus, canonicalizes every BM lookup
-# to the lower triangle (row_idx = max(idx_i, idx_j), col_idx = min(idx_i, idx_j) -- confirmed against
-# real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data, opposite of this resolver's original
-# upper-triangle assumption), reads each touched block once, sign-corrects with allele_order_i *
-# allele_order_j, and reports BM status separately from HT status.
+# among already-HT-resolved (idx, allele_order) variants for one locus, reads each touched block once,
+# sign-corrects with allele_order_i * allele_order_j, and reports BM status separately from HT status.
+#
+# Tile selection: real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm data confirmed the tile
+# (block_row, block_col) to open is (idx_j's band, idx_i's band) -- i.e. block_row >= block_col,
+# lower-triangle-inclusive at the tile level. But WITHIN a selected tile, the array offset is the
+# opposite of what tile selection alone would suggest: the row axis holds idx_i's (the smaller
+# canonical index) own local offset, and the col axis holds idx_j's (the larger) own local offset --
+# verified against two real blocks (one diagonal, one off-diagonal) fetched and manually decoded
+# against an independent Hail-computed LD reference.
 #
 # Fixture test/matrix_ld.bm: 6x6 matrix, blockSize=2 (3x3 grid of 2x2 blocks, flat index =
-# block_row*3+block_col). Lower-triangle blocks stored: 0,3,4,7,8; block 6 (rows4-5,cols0-1) is
-# deliberately missing to test bm_missing_block. Cell (row=3,col=1) is NaN to test bm_missing_or_nan.
-# Populated cells follow value(row,col)=row*10+col, so expected results are easy to hand-verify.
+# block_row*3+block_col). Tiles stored: 0,3,4,7,8; tile 6 (rows4-5,cols0-1) is deliberately missing to
+# test bm_missing_block. One cell within tile 3 is NaN to test bm_missing_or_nan. See
+# scripts/generate_blockmatrix_fixture.py's BLOCK_VALUES for the exact per-tile array contents.
 # Resolved indices given out of order on purpose, to prove canonicalization doesn't depend on input
 # order; idx=7 is out of the matrix's 0..5 range to test bm_index_out_of_bounds.
 query IIRTI
@@ -27,14 +32,14 @@ FROM hail_ld_bm_pairs('test/matrix_ld.bm', [
 ])
 ORDER BY idx_i, idx_j;
 ----
-0	1	-10.0	bm	0
-0	3	30.0	bm	0
+0	1	-1.0	bm	0
+0	3	21.0	bm	0
 0	4	NULL	bm	3
 0	7	NULL	bm	2
 1	3	NULL	bm	4
 1	4	NULL	bm	3
 1	7	NULL	bm	2
-3	4	-43.0	bm	0
+3	4	-52.0	bm	0
 3	7	NULL	bm	2
 4	7	NULL	bm	2
 
@@ -72,4 +77,4 @@ SET VARIABLE resolved = (
 query IIR
 SELECT idx_i, idx_j, r FROM hail_ld_bm_pairs('test/matrix_ld.bm', getvariable('resolved'));
 ----
-1	2	-21.0
+1	2	-30.0
