@@ -112,6 +112,27 @@ struct LocusInterval {
 	int64_t end = 0;
 };
 
+// Whether `a` is a supported allele sequence: 1 or more characters, every one A/C/G/T. Covers both
+// SNPs (length 1) and indels (length > 1, e.g. "AT" or "ATG") -- real Hail/PanUKBB HailTables store
+// indels in standard left-aligned/minimal form (a single shared anchor base plus the
+// inserted/deleted sequence, e.g. alleles ["T","TAC"] or ["GAGTA","G"], confirmed by sampling real
+// s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht data), so no normalization is
+// needed here -- this just accepts the string as given, matching the "no normalization, ever" policy
+// that already applies to contigs and positions. Rejects ambiguity codes (e.g. "N"), digits, and any
+// other non-ACGT character. Shared by ClassifyLocusVariants, hail_ld_preflight_debug, and
+// hail_ld_parse_token so the validation rule can't drift between them.
+static bool IsSupportedAlleleSequence(const std::string &a) {
+	if (a.empty()) {
+		return false;
+	}
+	for (char c : a) {
+		if (c != 'A' && c != 'C' && c != 'G' && c != 'T') {
+			return false;
+		}
+	}
+	return true;
+}
+
 struct PreflightBindData : public TableFunctionData {
 	std::string request_arg;
 };
@@ -246,13 +267,7 @@ static void ClassifyLocusVariants(const std::string &locus_id, const std::string
 			for (char c : pentry.pos)
 				if (!isdigit((unsigned char)c))
 					okpos = false;
-			auto is_base = [&](const string &a) {
-				if (a.size() != 1)
-					return false;
-				char C = a[0];
-				return C == 'A' || C == 'C' || C == 'G' || C == 'T';
-			};
-			if (okpos && is_base(pentry.ref) && is_base(pentry.alt)) {
+			if (okpos && IsSupportedAlleleSequence(pentry.ref) && IsSupportedAlleleSequence(pentry.alt)) {
 				pentry.ok = true;
 			}
 		}
@@ -1735,13 +1750,7 @@ HailLDPreflightInitLocalDebug(ExecutionContext &context, TableFunctionInitInput 
 					ok = 0;
 					break;
 				}
-			if (ref.size() != 1 || alt.size() != 1)
-				ok = 0;
-			auto is_base = [&](const std::string &a) {
-				char C = a[0];
-				return a.size() == 1 && (C == 'A' || C == 'C' || C == 'G' || C == 'T');
-			};
-			if (!is_base(ref) || !is_base(alt))
+			if (!IsSupportedAlleleSequence(ref) || !IsSupportedAlleleSequence(alt))
 				ok = 0;
 		}
 		state->rows.push_back({original_raw, stripped, contig, pos_str, ref, alt, ok});
@@ -1928,11 +1937,7 @@ void RegisterHailLDQueryFunctions(ExtensionLoader &loader) {
 					    ok = 0;
 					    break;
 				    }
-			    auto is_base = [&](const std::string &a) {
-				    char C = a[0];
-				    return a.size() == 1 && (C == 'A' || C == 'C' || C == 'G' || C == 'T');
-			    };
-			    if (!is_base(ref) || !is_base(alt))
+			    if (!IsSupportedAlleleSequence(ref) || !IsSupportedAlleleSequence(alt))
 				    ok = 0;
 			    std::string out = stripped + "|" + contig + "|" + pos + "|" + ref + "|" + alt + "|" + to_string(ok);
 			    return StringVector::AddString(result, out);

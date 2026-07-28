@@ -102,6 +102,17 @@ All notable changes to this project will be documented in this file.
   `linux/arm64`) image by `.github/workflows/docker-release-image.yml`, which runs only on tag
   pushes and tags the image with the pushed tag's name plus `latest`.
 
+### Changed
+
+- The LD query pipeline (`hail_ld_preflight`/`hail_ld_preflight_requests`/`hail_ld_resolve_ht`/
+  `hail_ld_materialize`) now accepts indels, not just SNPs: `ref`/`alt` may be one or more
+  characters (previously exactly one), still restricted to `A`/`C`/`G`/`T` (ambiguity codes like
+  `N`, digits, and symbolic alleles remain rejected as `unsupported_variant_id`). No normalization
+  is performed — matching real Hail/PanUKBB HailTables, which already store indels in standard
+  left-aligned/minimal form. The three previously-duplicated single-character validation checks
+  (`ClassifyLocusVariants`, `hail_ld_preflight_debug`, `hail_ld_parse_token`) were consolidated into
+  one shared `IsSupportedAlleleSequence` helper.
+
 ### Fixed
 
 - `hail_ld_materialize` no longer buffers its full result set as in-memory

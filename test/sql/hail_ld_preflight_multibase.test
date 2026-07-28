@@ -3,12 +3,15 @@
 
 require quack
 
-# Multi-base allele / indel / 'N' handling
+# Multi-character allele (indel) / 'N' handling. Indels -- ref and/or alt longer than one character,
+# every character A/C/G/T -- are supported and pass preflight like any other well-formed token
+# (real resolution against the HT happens later, in hail_ld_resolve_ht). A non-ACGT character (e.g.
+# the ambiguity code "N") is still rejected regardless of length.
 query II
 SELECT requested_variant_id, status_code FROM hail_ld_preflight('locusX|chr1:1-300| chr1_201_AT_G , chr1_202_A_GG , chr1_203_N_A , chr1_204_A_T ')
 ORDER BY requested_variant_id;
 ----
-chr1_201_AT_G	5
-chr1_202_A_GG	5
+chr1_201_AT_G	0
+chr1_202_A_GG	0
 chr1_203_N_A	5
 chr1_204_A_T	0

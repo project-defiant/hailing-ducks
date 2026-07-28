@@ -4,10 +4,23 @@
 require quack
 
 # Scalar parse helper test
+
+# Indels (multi-character ref/alt, all A/C/G/T) are valid.
 query I
 SELECT hail_ld_parse_token(' chr1_201_AT_G ') AS p;
 ----
-chr1_201_AT_G|chr1|201|AT|G|0
+chr1_201_AT_G|chr1|201|AT|G|1
+
+query I
+SELECT hail_ld_parse_token('chr1_202_A_GG') AS p;
+----
+chr1_202_A_GG|chr1|202|A|GG|1
+
+# A non-ACGT character (ambiguity code "N") is still rejected regardless of length.
+query I
+SELECT hail_ld_parse_token('chr1_203_N_A') AS p;
+----
+chr1_203_N_A|chr1|203|N|A|0
 
 query I
 SELECT hail_ld_parse_token('chr1_204_A_T') AS p;

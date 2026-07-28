@@ -333,8 +333,12 @@ LD_ETYPE = "+EBaseStruct{idx:+EInt64,locus:EBaseStruct{contig:+EBinary,position:
 # contig) and one on chr2 (to test contig-based pruning). Row contents cover: an exact match, a
 # flipped match, a multi-allelic row colliding with a request (must NOT be coerced into a match), a
 # row with no matching request (not_found_in_ht), two same-position rows that both match one request
-# in opposite orientations (ambiguous_in_ht), a NULL-alleles row, and a NULL-locus row (both must be
-# skipped during scanning, not crash).
+# in opposite orientations (ambiguous_in_ht), a NULL-alleles row, a NULL-locus row (both must be
+# skipped during scanning, not crash), and an indel row (idx=9, an insertion: alleles are the real
+# Hail/PanUKBB convention of a single shared anchor base plus the inserted sequence, e.g. ["A","ATG"]
+# -- confirmed against real s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht data,
+# which stores indels the same way) proving indel resolution isn't restricted to single-character
+# alleles.
 LD_PARTITIONS = [
     [
         {"idx": 0, "locus": ("chr1", 150), "alleles": None},
@@ -342,6 +346,7 @@ LD_PARTITIONS = [
         {"idx": 2, "locus": ("chr1", 300), "alleles": ["G", "A"]},
         {"idx": 3, "locus": ("chr1", 400), "alleles": ["A", "G", "T"]},
         {"idx": 8, "locus": None, "alleles": ["A", "G"]},
+        {"idx": 9, "locus": ("chr1", 350), "alleles": ["A", "ATG"]},
     ],
     [
         {"idx": 4, "locus": ("chr1", 700), "alleles": ["C", "T"]},

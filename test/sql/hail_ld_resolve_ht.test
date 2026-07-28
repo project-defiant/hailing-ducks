@@ -8,7 +8,8 @@ require parquet
 # hail_ld_resolve_ht(ht_path, requests_path): resolves preflight candidates against a real HailTable
 # using per-locus direct/flipped allele sets and partition pruning (test/hailtable_fixture_ld.ht).
 # Covers: exact match, flipped match, not-found, multi-allelic non-coercion, unsupported passthrough,
-# multiple_variants_at_position passthrough, outside_locus passthrough, and a second contig.
+# multiple_variants_at_position passthrough, outside_locus passthrough, an indel exact match, and a
+# second contig.
 statement ok
 COPY (
   SELECT * FROM (VALUES
@@ -18,7 +19,8 @@ COPY (
       'chr1_400_A_G',   -- collides with a 3-allele HT row (idx=3): must not be coerced -> not_found_in_ht
       'chr1_250_XY_G',  -- unsupported_variant_id (preflight-level, never reaches HT)
       'chr1_450_A_G', 'chr1_450_G_C',  -- multiple_variants_at_position (preflight-level)
-      'chr1_999_A_T'    -- outside_locus (preflight-level, locus range ends at 500)
+      'chr1_999_A_T',   -- outside_locus (preflight-level, locus range ends at 500)
+      'chr1_350_A_ATG'  -- indel exact match: HT idx=9 alleles=[A,ATG]
     ]),
     ('locus2', 'chr1:600-1000', [
       'chr1_650_A_T',   -- no HT row at this position -> not_found_in_ht
@@ -38,6 +40,7 @@ ORDER BY locus_id, requested_variant_id;
 locus1	chr1_200_A_G	chr1_200_A_G	1	1	variant	0
 locus1	chr1_250_XY_G	NULL	NULL	NULL	variant	5
 locus1	chr1_300_A_G	chr1_300_G_A	2	-1	variant	1
+locus1	chr1_350_A_ATG	chr1_350_A_ATG	9	1	variant	0
 locus1	chr1_400_A_G	NULL	NULL	NULL	variant	2
 locus1	chr1_450_A_G	NULL	NULL	NULL	variant	6
 locus1	chr1_450_G_C	NULL	NULL	NULL	variant	6

@@ -3,12 +3,13 @@
 
 require quack
 
-# Debug parse emission: show original, stripped and parsed parts
+# Debug parse emission: show original, stripped and parsed parts. Indels (multi-character ref/alt,
+# all A/C/G/T) parse as valid; a non-ACGT character ("N") is still rejected regardless of length.
 query TTTTTTI
 SELECT original_token, stripped_token, contig, pos, ref, alt, parse_ok FROM hail_ld_preflight_debug('locusX|1:1-100| chr1_201_AT_G , chr1_202_A_GG , chr1_203_N_A , chr1_204_A_T ')
 ORDER BY stripped_token;
 ----
- chr1_201_AT_G 	chr1_201_AT_G	chr1	201	AT	G	0
- chr1_202_A_GG 	chr1_202_A_GG	chr1	202	A	GG	0
+ chr1_201_AT_G 	chr1_201_AT_G	chr1	201	AT	G	1
+ chr1_202_A_GG 	chr1_202_A_GG	chr1	202	A	GG	1
  chr1_203_N_A 	chr1_203_N_A	chr1	203	N	A	0
  chr1_204_A_T 	chr1_204_A_T	chr1	204	A	T	1

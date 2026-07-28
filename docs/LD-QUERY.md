@@ -88,8 +88,8 @@ One row per fine-mapping locus:
 | Column | Type | Notes |
 |---|---|---|
 | `locus_id` | `VARCHAR` | Caller-assigned identifier, unique per request row. |
-| `locus` | `VARCHAR` | `<contig>:<start>-<end>`, e.g. `chr1:36098798-36652278`. Must match the HT's own contig convention exactly (see "No normalization" below) — PanUKBB b38 tables use `chr1`, not `1`. |
-| `variant_ids` | `LIST<VARCHAR>` | Biallelic IDs, `<contig>_<position>_<ref>_<alt>`, e.g. `chr1_36098874_C_T`. |
+| `locus` | `VARCHAR` | `<contig>:<start>-<end>`, e.g. `chr1:36098798-36652278`. Must match the HT's own contig convention exactly (see "No normalization" below) — whatever that HT actually uses (`chr1` for PanUKBB b38 tables; a bare `1` for a table whose own convention is bare). |
+| `variant_ids` | `LIST<VARCHAR>` | Biallelic IDs, `<contig>_<position>_<ref>_<alt>`, e.g. `chr1_36098874_C_T` (SNP) or `chr1_36098874_C_CTG` (indel). |
 
 ## Event/output schemas
 
@@ -132,7 +132,7 @@ BIGINT)`, and writes:
 | variant | 2 | `not_found_in_ht` | No HT row at that contig/position, in either orientation. |
 | variant | 3 | `outside_locus` | Variant's own contig/position falls outside the request's `locus` interval. Detected before any HT work. |
 | variant | 4 | `ambiguous_in_ht` | The HT itself has more than one row matching this candidate (both orientations, or a genuine HT-side duplicate) — reserved exclusively for ambiguity discovered *during* HT resolution. |
-| variant | 5 | `unsupported_variant_id` | Not a supported biallelic `contig_pos_ref_alt` format (e.g. an indel — multi-character ref/alt). |
+| variant | 5 | `unsupported_variant_id` | Not a supported biallelic `contig_pos_ref_alt` format — `ref`/`alt` contain a non-`A`/`C`/`G`/`T` character (e.g. the ambiguity code `N`, a digit, or symbolic/structural-variant notation), or the token doesn't split into 4+ underscore-delimited fields, or the position isn't numeric. Indels (multi-character `ref`/`alt`) are supported and do not get this status on their own. |
 | variant | 6 | `multiple_variants_at_position` | Two or more *distinct* requested IDs share one contig/position (whether or not they're ref/alt flips of each other) — a request-level conflict, detected before any HT work. |
 | bm | 0 | `bm_resolved` | LD value successfully extracted. |
 | bm | 1 | `bm_missing_in_ht` | Reserved for a pair where one side never resolved in HT; not producible by this resolver's own inputs, since pairs are only ever generated among already-resolved variants. |
@@ -144,13 +144,26 @@ BIGINT)`, and writes:
 
 - **No normalization, ever.** Contigs, positions, and alleles are taken exactly as given — no
   liftover, no left-alignment/trimming, no case folding, no reverse-complementing. Request IDs and
-  locus contigs must already match the HT's own convention (`chr1`, not `1`, for PanUKBB b38 tables).
-  If you need to align an hg19 HT to hg38 yourself, do it with Hail before pointing this extension at
-  it — see the git history around 2026-07-28 for a worked example and a real bug this uncovered
-  (`ResolveHTCore` used to crash on a HT row with a `NULL` locus, e.g. an unfiltered failed-liftover
-  row; fixed, but dropping such rows before finalizing your table is still the right call).
-- **Biallelic only.** Requested IDs must be `contig_pos_ref_alt` with single-character `A/C/G/T`
-  bases; HT rows whose `alleles` array isn't length 2 are never eligible for matching (not coerced).
+  locus contigs must already match the HT's own convention exactly, whatever it is for that
+  particular table (`chr1` for PanUKBB b38 tables; a bare `1` works identically against a table
+  whose own `locus.contig` convention is bare — contig comparison is plain string equality
+  throughout, with no `chr`-stripping/adding in either direction, so this "just works" for any
+  convention without configuration). If you need to align an hg19 HT to hg38 yourself, do it with
+  Hail before pointing this extension at it — see the git history around 2026-07-28 for a worked
+  example and a real bug this uncovered (`ResolveHTCore` used to crash on a HT row with a `NULL`
+  locus, e.g. an unfiltered failed-liftover row; fixed, but dropping such rows before finalizing
+  your table is still the right call).
+- **Biallelic only, indels included.** Requested IDs must be `contig_pos_ref_alt` with `ref`/`alt`
+  each one or more characters, every character `A`/`C`/`G`/`T` (rejects ambiguity codes like `N`,
+  digits, and symbolic/structural-variant notation such as `*` or `<DEL>`). This covers both SNPs
+  (`chr1_100_A_G`) and indels (`chr1_100_A_ATG`) with the same rule — no length restriction, no
+  normalization: real Hail/PanUKBB HailTables already store indels in standard left-aligned/minimal
+  form (a single shared anchor base plus the inserted/deleted sequence, e.g. alleles `["T","TAC"]`
+  or `["GAGTA","G"]`, confirmed by sampling real
+  `s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.variant.b38.ht` data), so requested IDs just need
+  to match that same convention, exactly like SNPs already do. HT rows whose `alleles` array isn't
+  length 2 are never eligible for matching regardless (not coerced) — that's a separate,
+  arity-based restriction (multi-allelic sites), not a variant-type restriction.
 - **Exact duplicates collapse; distinct same-position IDs conflict.** A requested ID repeated
   verbatim within one locus is deduplicated silently. Two *different* IDs at the same contig/position
   — flips of each other or not — both get `multiple_variants_at_position` (6) and never reach HT
