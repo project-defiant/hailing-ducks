@@ -26,22 +26,28 @@ LD_BM_FIXTURE_DIR = ROOT / "test" / "matrix_ld.bm"
 #   0=(0,0) 1=(0,1) 2=(0,2)
 #   3=(1,0) 4=(1,1) 5=(1,2)
 #   6=(2,0) 7=(2,1) 8=(2,2)
-# Symmetric-matrix (LD) storage keeps only the upper triangle (block_row <= block_col): 0,1,2,4,5,8.
-# Block 2 is deliberately OMITTED here (not 3/6/7, which are legitimately lower-triangle and never
-# queried by a correctly canonicalized upper-triangle resolver) to simulate a genuinely missing
-# upper-triangle block for bm_missing_block testing.
+# Symmetric-matrix (LD) storage keeps only the LOWER triangle (block_row >= block_col): 0,3,4,7,8.
+# Confirmed against real data: every stored block index in
+# s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm/metadata.json's `maybeFiltered` (sampled across
+# its full range, ~30 blocks) satisfies block_row >= block_col -- the resolver originally assumed the
+# opposite (upper triangle) and was fixed after this fixture/smoke-testing caught it.
+# Block 6=(2,0) is deliberately OMITTED here (not 1/2/5, which are legitimately upper-triangle and
+# never queried by a correctly canonicalized lower-triangle resolver) to simulate a genuinely missing
+# lower-triangle block for bm_missing_block testing.
 N_ROWS = 6
 N_COLS = 6
 BLOCK_SIZE = 2
 
-# block_idx -> 2x2 values[row][col] (local to the block); only specific cells are ever read by the
-# resolver's test pairs, so most cells are filler.
+# block_idx -> 2x2 values[row][col] (local to the block). Values follow value(row, col) = row*10+col
+# for every populated cell (global row/col), so expected test results are easy to hand-verify; one
+# cell is overridden to NaN for the bm_missing_or_nan path.
 BLOCK_VALUES = {
-    0: [[1.1, 0.5], [2.2, 3.3]],  # [0][1]=0.5 used by pair (0,1)
-    1: [[9.9, 0.8], [9.9, float("nan")]],  # [0][1]=0.8 used by (0,3); [1][1]=NaN used by (1,3)
-    4: [[1.0, 2.0], [3.0, 4.0]],  # unused by test pairs, present for completeness
-    5: [[7.0, 7.0], [0.2, 7.0]],  # [1][0]=0.2 used by pair (3,4)
-    8: [[5.0, 6.0], [7.0, 8.0]],  # unused by test pairs, present for completeness
+    0: [[0, 1], [10, 11]],  # (0,0): rows0-1,cols0-1 -- [1][0]=v(1,0)=10 used by pair (0,1)
+    3: [[20, 21], [30, float("nan")]],  # (1,0): rows2-3,cols0-1 -- [1][0]=v(3,0)=30 used by (0,3);
+    # [1][1] overridden to NaN (would be v(3,1)=31) -- used by (1,3)
+    4: [[22, 23], [32, 33]],  # (1,1): rows2-3,cols2-3 -- [1][0]=v(3,2)=32 used by pair (2,3)
+    7: [[42, 43], [52, 53]],  # (2,1): rows4-5,cols2-3 -- [0][1]=v(4,3)=43 used by pair (3,4)
+    8: [[44, 45], [54, 55]],  # (2,2): rows4-5,cols4-5 -- unused by test pairs, present for completeness
 }
 STORED_BLOCK_INDICES = sorted(BLOCK_VALUES.keys())
 

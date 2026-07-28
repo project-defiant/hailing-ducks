@@ -1006,7 +1006,12 @@ static unique_ptr<FunctionData> HailLDBMPairsBind(ClientContext &context, TableF
 				continue;
 			}
 			bool missing_block = false;
-			double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
+			// Real PanUKBB BlockMatrix storage is LOWER-triangle-inclusive (row_idx >= col_idx) --
+			// confirmed against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm's metadata.json,
+			// where every stored block index satisfies block_row >= block_col across its full range.
+			// So the larger canonical index (idx_j) addresses the row, the smaller (idx_i) the
+			// column; idx_i/idx_j in the OUTPUT are unaffected, only the internal cell address swaps.
+			double raw_value = get_cell(out.idx_j, out.idx_i, missing_block);
 			if (missing_block) {
 				out.status_code = 3; // bm_missing_block
 			} else if (std::isnan(raw_value)) {
@@ -1254,7 +1259,12 @@ ProcessBMPairsBatch(ClientContext &context, const std::string &bm_path,
 					continue;
 				}
 				bool missing_block = false;
-				double raw_value = get_cell(out.idx_i, out.idx_j, missing_block);
+				// Real PanUKBB BlockMatrix storage is LOWER-triangle-inclusive (row_idx >= col_idx) --
+				// confirmed against s3://pan-ukb-us-east-1/ld_release/UKBB.EUR.ldadj.bm's metadata.json,
+				// where every stored block index satisfies block_row >= block_col across its full
+				// range. So the larger canonical index (idx_j) addresses the row, the smaller (idx_i)
+				// the column; idx_i/idx_j in the OUTPUT are unaffected, only the cell address swaps.
+				double raw_value = get_cell(out.idx_j, out.idx_i, missing_block);
 				if (missing_block) {
 					out.status_code = 3; // bm_missing_block
 				} else if (std::isnan(raw_value)) {
