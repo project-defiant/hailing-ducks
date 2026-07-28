@@ -148,6 +148,25 @@ con.execute(
 )
 ```
 
+### Option D — Docker image (pre-built, `quack` + `httpfs` already loaded)
+
+A release image (multi-arch: `linux/amd64` + `linux/arm64`) is published to GHCR on every tagged
+release, bundling the DuckDB CLI with both extensions already built in — no `INSTALL`/`LOAD` needed:
+
+```sh
+docker run --rm -it -v "$(pwd):/data" ghcr.io/project-defiant/hailing-ducks:latest \
+  -c "SELECT * FROM hail_scan_blockmatrix('/data/my_matrix.bm') LIMIT 10;"
+```
+
+Pin to a specific released version instead of `latest` by using its tag, e.g. `:v1.0.0`. To build
+the image yourself (see `Dockerfile`):
+
+```sh
+git submodule update --init --recursive
+docker build -t hailing-ducks .
+docker run --rm -it -v "$(pwd)/test:/data" hailing-ducks -c "SELECT COUNT(*) FROM hail_scan_blockmatrix('/data/matrix.bm');"
+```
+
 ---
 
 ## Usage

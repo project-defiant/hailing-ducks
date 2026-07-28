@@ -96,6 +96,11 @@ All notable changes to this project will be documented in this file.
     behavior through observable SQL output rather than internal state.
   - `make test_s3_smoke`: opt-in SQLLogicTest run against real PanUKBB HT/BM
     data over S3/httpfs; skips cleanly without network access.
+- **Docker image** (`Dockerfile`): multi-stage build producing a runtime image with the DuckDB CLI
+  and both the `quack` and `httpfs` extensions already built in (no `INSTALL`/`LOAD` needed).
+  Published to `ghcr.io/project-defiant/hailing-ducks` as a multi-arch (`linux/amd64` +
+  `linux/arm64`) image by `.github/workflows/docker-release-image.yml`, which runs only on tag
+  pushes and tags the image with the pushed tag's name plus `latest`.
 
 ### Fixed
 
